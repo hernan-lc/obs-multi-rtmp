@@ -20,6 +20,9 @@ list(APPEND CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-studio-32.2.
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+find_package(CURL REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CURL::libcurl)
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
@@ -55,6 +58,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   ./src/protocols.cpp
   ./src/helpers.h
   ./src/helpers.cpp
+  ./src/streamlabs-tiktok.h
+  ./src/streamlabs-tiktok.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -63,3 +68,11 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(test-streamlabs-tiktok ./tests/test-streamlabs-tiktok.cpp ./src/streamlabs-tiktok.cpp)
+  target_include_directories(test-streamlabs-tiktok PRIVATE ./src ./dep/nlohmann-json)
+  target_link_libraries(test-streamlabs-tiktok PRIVATE CURL::libcurl)
+  add_test(NAME streamlabs-tiktok COMMAND test-streamlabs-tiktok)
+endif()
