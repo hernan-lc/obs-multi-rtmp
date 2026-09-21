@@ -6,6 +6,8 @@
 #include <QTabWidget>
 #include <qevent.h>
 #include <QComboBox>
+#include <QDesktopServices>
+#include <QUrl>
 
 #include <regex>
 
@@ -244,6 +246,12 @@ class EditOutputWidgetImpl: public EditOutputWidget
 
     QCheckBox* syncStart_ = 0;
     QCheckBox *syncStop_ = 0;
+
+    QCheckBox* tiktokEnable_ = 0;
+    QLineEdit* tiktokToken_ = 0;
+    QLineEdit* tiktokTitle_ = 0;
+    QLineEdit* tiktokCategory_ = 0;
+    QCheckBox* tiktokMature_ = 0;
 
     std::vector<std::string> EnumEncodersByCodec(const char* codec)
     {
@@ -642,6 +650,29 @@ public:
                     otherLayout->addWidget(syncStop_ = new QCheckBox(obs_module_text("SyncStop"), gp), 1, 0);
                     gp->setLayout(otherLayout);
                 }
+
+                {
+                    auto gp = new QGroupBox(obs_module_text("TikTok.Settings"), container_);
+                    sub_grid->addWidget(gp, 2, 0, 1, 2);
+                    auto tiktokLayout = new QGridLayout();
+                    tiktokLayout->addWidget(tiktokEnable_ = new QCheckBox(obs_module_text("TikTok.Enable"), gp),
+                                            0, 0, 1, 2);
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Token"), gp), 1, 0);
+                    tiktokLayout->addWidget(tiktokToken_ = new QLineEdit("", gp), 1, 1);
+                    tiktokToken_->setEchoMode(QLineEdit::Password);
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Title"), gp), 2, 0);
+                    tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", gp), 2, 1);
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Category"), gp), 3, 0);
+                    tiktokLayout->addWidget(tiktokCategory_ = new QLineEdit("", gp), 3, 1);
+                    tiktokLayout->addWidget(tiktokMature_ = new QCheckBox(obs_module_text("TikTok.MatureContent"), gp),
+                                            4, 0);
+                    auto getToken = new QPushButton(obs_module_text("TikTok.GetToken"), gp);
+                    QObject::connect(getToken, &QPushButton::clicked, []() {
+                        QDesktopServices::openUrl(QUrl("https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator"));
+                    });
+                    tiktokLayout->addWidget(getToken, 4, 1);
+                    gp->setLayout(tiktokLayout);
+                }
             }
             layout->addLayout(sub_grid, 1);
         }
@@ -958,6 +989,11 @@ public:
         config_->protocol = tostdu8(protocolSelector_->itemData(protocolSelector_->currentIndex()).toString());
         config_->syncStart = syncStart_->isChecked();
         config_->syncStop = syncStop_->isChecked();
+        config_->tiktok.enabled = tiktokEnable_->isChecked();
+        config_->tiktok.token = tostdu8(tiktokToken_->text());
+        config_->tiktok.title = tostdu8(tiktokTitle_->text());
+        config_->tiktok.category = tostdu8(tiktokCategory_->text());
+        config_->tiktok.matureContent = tiktokMature_->isChecked();
         config_->outputParam = outputSettings_->Save();
         config_->serviceParam = serviceSettings_->Save();
 
@@ -999,6 +1035,11 @@ public:
         protocolSelector_->setCurrentIndex(protocolIndex);
         syncStart_->setChecked(target.syncStart);
         syncStop_->setChecked(target.syncStop);
+        tiktokEnable_->setChecked(target.tiktok.enabled);
+        tiktokToken_->setText(QString::fromUtf8(target.tiktok.token));
+        tiktokTitle_->setText(QString::fromUtf8(target.tiktok.title));
+        tiktokCategory_->setText(QString::fromUtf8(target.tiktok.category));
+        tiktokMature_->setChecked(target.tiktok.matureContent);
     }
 
     using IdOrVideoConfig = std::variant<std::string_view, VideoEncoderConfig*>;
