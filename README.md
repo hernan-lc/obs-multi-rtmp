@@ -52,3 +52,63 @@ If you find this tool useful and want to doante, here is the link. (Please do no
 
 This project uses obs-plugintemplate.   
 Please refer to obs-plugintemplate to understand how it works.
+
+## TikTok LIVE via Streamlabs (Linux)
+
+Any output target can optionally stream to TikTok LIVE. When enabled, the
+plugin calls the Streamlabs API to create a TikTok LIVE session, receives a
+fresh RTMP server/key pair, and streams to it with the normal OBS output.
+Stopping the target (or closing OBS / switching profiles) ends the TikTok
+LIVE session again.
+
+TikTok stream access is controlled by TikTok/Streamlabs account eligibility.
+This plugin does not grant LIVE permission to an account.
+
+### Setup
+
+1. Get a Streamlabs token with the
+   [StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator)
+   project (the "Get Streamlabs Token" button in the target settings opens it).
+2. In the target settings, open the "TikTok / Streamlabs" section.
+3. Check "Enable TikTok via Streamlabs" and fill in the Streamlabs token,
+   stream title, category and mature-content flag.
+4. Keep the target protocol on RTMP and press Start.
+
+The category must match a TikTok category name exactly (case-insensitive);
+unknown or empty categories stream under "Other". The plugin never
+fuzzy-matches an unrelated game.
+
+### Linux support
+
+- Native packages: build with the `ubuntu-x86_64` preset
+  (`cmake --preset ubuntu-x86_64`). Requires libcurl development files
+  (`libcurl4-openssl-dev` on Ubuntu).
+- Flatpak: the existing `com.obsproject.Studio.Plugin.MultiRTMP` extension
+  manifest works unchanged (libcurl ships with the Freedesktop SDK, network
+  access is inherited from OBS). See [FLATPAK.md](./FLATPAK.md).
+
+### Security notes
+
+- The Streamlabs credential is stored in plain text in the OBS profile file
+  `obs-multi-rtmp.json`. Anyone with read access to your OBS profile can read
+  it. OS keychain storage is a planned follow-up.
+- The credential is only ever sent to `https://streamlabs.com` over TLS with
+  certificate verification enabled. It is never logged and never placed in
+  RTMP URLs.
+- Generated RTMP server/key pairs and the TikTok session id are kept in
+  memory only and are never written to disk.
+
+### Troubleshooting
+
+- "TikTok Streamlabs token is missing.": enablement requires the dedicated
+  Streamlabs token field, not the RTMP password field.
+- "Streamlabs authentication failed.": the token is invalid or expired;
+  generate a new one.
+- "TikTok LIVE access is not available for this account.": the linked
+  TikTok/Streamlabs account is not eligible for LIVE.
+- "Streamlabs rate limit reached." / "Streamlabs service temporarily
+  unavailable.": wait and retry.
+- "Could not contact Streamlabs.": check network access and proxy settings.
+  Requests time out after 5 s (connect) / 15 s (total).
+- The TikTok LIVE session is always ended when the output stops, including
+  forced stops, OBS shutdown and profile switches.

@@ -67,5 +67,8 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
   }
 
   sudo apt-get install ${apt_args} ${_qt_packages}
+
+  # Streamlabs TikTok client.
+  sudo apt-get install ${apt_args} libcurl4-openssl-dev${suffix}
   log_group
 }
