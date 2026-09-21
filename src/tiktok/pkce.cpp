@@ -1,5 +1,7 @@
 #include "tiktok/pkce.h"
 
+#include <array>
+
 #include <QCryptographicHash>
 #include <QRandomGenerator>
 
@@ -12,10 +14,13 @@ QByteArray PkceChallengeFor(const QByteArray &verifier)
 PkcePair GeneratePkce()
 {
     PkcePair pair;
-    QByteArray randomBytes(64, Qt::Uninitialized);
     // QRandomGenerator::system() is a CSPRNG seeded from OS entropy.
-    QRandomGenerator::system()->fillRange(reinterpret_cast<quint32 *>(randomBytes.data()),
-                                          static_cast<qsizetype>(randomBytes.size() / 4));
+    // Fill naturally aligned words first: QByteArray storage has no
+    // guaranteed quint32 alignment.
+    std::array<quint32, 16> randomWords{};
+    QRandomGenerator::system()->fillRange(randomWords.data(), randomWords.size());
+    const QByteArray randomBytes(reinterpret_cast<const char *>(randomWords.data()),
+                                 static_cast<qsizetype>(sizeof(randomWords)));
     pair.verifier = randomBytes.toHex().toLower();
     if (pair.verifier.size() != 128)
         return {};

@@ -345,6 +345,30 @@ static int TestAccountResponseHttpErrors()
     return 0;
 }
 
+static int TestCredentialValidation()
+{
+    TikTokAccountResult valid;
+    valid.success = true;
+    CHECK(ClassifyCredentialResult(valid) == CredentialValidation::Valid);
+
+    TikTokAccountResult invalid;
+    invalid.failure = TikTokFailure::Auth;
+    CHECK(ClassifyCredentialResult(invalid) == CredentialValidation::InvalidCredential);
+
+    TikTokAccountResult forbidden;
+    forbidden.failure = TikTokFailure::Forbidden;
+    CHECK(ClassifyCredentialResult(forbidden) == CredentialValidation::ValidLiveForbidden);
+
+    TikTokStartResult timeout;
+    timeout.failure = TikTokFailure::Timeout;
+    CHECK(ClassifyCredentialResult(timeout) == CredentialValidation::TemporaryFailure);
+
+    TikTokCategoryListResult server;
+    server.failure = TikTokFailure::Server;
+    CHECK(ClassifyCredentialResult(server) == CredentialValidation::TemporaryFailure);
+    return 0;
+}
+
 static int TestCategoryListResponse()
 {
     const std::string body = R"({"categories":[
@@ -412,6 +436,8 @@ int main()
     if (TestAccountResponseHttpErrors())
         return 1;
     if (TestCategoryListResponse())
+        return 1;
+    if (TestCredentialValidation())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;

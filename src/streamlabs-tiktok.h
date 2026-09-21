@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,23 @@ enum class TikTokFailure {
     NotFound,       // HTTP 404
     RateLimited,    // HTTP 429
     Server,         // HTTP 5xx
-    InvalidResponse // HTTP 2xx but the payload is unusable
+    InvalidResponse, // HTTP 2xx but the payload is unusable
+    Cancelled       // aborted via TikTokNetworkCancel (shutdown/cancel path)
+};
+
+// RAII cancellation for Streamlabs requests on the calling thread. The
+// managed worker sets this around every job so shutdown can abort
+// in-flight transfers instead of waiting out full timeouts.
+class TikTokNetworkCancel {
+public:
+    explicit TikTokNetworkCancel(const std::atomic<bool> *flag);
+    ~TikTokNetworkCancel();
+
+    TikTokNetworkCancel(const TikTokNetworkCancel &) = delete;
+    TikTokNetworkCancel &operator=(const TikTokNetworkCancel &) = delete;
+
+private:
+    const std::atomic<bool> *previous_;
 };
 
 // Result of POST /slobs/tiktok/stream/start. `server` and `key` are secrets:
@@ -64,6 +81,28 @@ struct TikTokCategoryListResult {
     std::string error;
     std::vector<TikTokCategoryEntry> categories;
 };
+
+// One credential decision for every Streamlabs response shape. 401 means
+// the Bearer [REDACTED] is invalid; 403 means the credential may still be valid
+// while TikTok LIVE access is unavailable; everything else is temporary.
+enum class CredentialValidation {
+    Valid,
+    ValidLiveForbidden,
+    InvalidCredential,
+    TemporaryFailure
+};
+
+template<typename TikTokResult>
+inline CredentialValidation ClassifyCredentialResult(const TikTokResult &result)
+{
+    if (result.success)
+        return CredentialValidation::Valid;
+    if (result.failure == TikTokFailure::Auth)
+        return CredentialValidation::InvalidCredential;
+    if (result.failure == TikTokFailure::Forbidden)
+        return CredentialValidation::ValidLiveForbidden;
+    return CredentialValidation::TemporaryFailure;
+}
 
 // Minimal synchronous client for the Streamlabs TikTok endpoints used by the
 // StreamLabsTikTokStreamKeyGenerator project:

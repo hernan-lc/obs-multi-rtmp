@@ -81,11 +81,12 @@ std::string BuildExchangeStartJs(const std::string &exchangeUrl, const std::stri
     std::string js;
     js += "(function() {\n";
     js += "  var EP = " + pageJson + ";\n";
+    js += "  var P = window.location.host + window.location.pathname;\n";
+    js += "  if (P !== EP) return 'wrong-page';\n";
     js += "  var r = window.__multirtmp_tiktok_exchange;\n";
     js += "  if (r != null && (r.page === EP || r.success === true)) return 'kept';\n";
     js += "  window.__multirtmp_tiktok_exchange_seq = ((window.__multirtmp_tiktok_exchange_seq | 0) + 1);\n";
     js += "  var mySeq = window.__multirtmp_tiktok_exchange_seq;\n";
-    js += "  var P = window.location.host + window.location.pathname;\n";
     js += "  window.__multirtmp_tiktok_exchange = null;\n";
     js += "  function errText(err) {\n";
     js += "    var name = (err && err.name) ? err.name + ': ' : '';\n";

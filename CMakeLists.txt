@@ -6,6 +6,7 @@ project(${_name} VERSION ${_version})
 
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
+option(ENABLE_TIKTOK_LOGIN "Enable embedded TikTok login via Qt WebEngine" ON)
 
 include(compilerconfig)
 include(defaults)
@@ -23,6 +24,23 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 find_package(CURL REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CURL::libcurl)
 
+# Optional Linux secure credential backend. When libsecret development
+# files are available, link them and use the official API. Otherwise the
+# plugin still builds and uses the memory-only credential fallback.
+set(TIKTOK_HAVE_LIBSECRET OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(LIBSECRET IMPORTED_TARGET libsecret-1)
+    if(LIBSECRET_FOUND)
+      set(TIKTOK_HAVE_LIBSECRET ON)
+    endif()
+  endif()
+  if(NOT TIKTOK_HAVE_LIBSECRET)
+    message(STATUS "obs-multi-rtmp: libsecret not found, Linux secure credential storage disabled")
+  endif()
+endif()
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
@@ -31,18 +49,17 @@ endif()
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
-  # Qt WebEngine provides the embedded TikTok login browser. It is
-  # resolved separately from Widgets because "Widgets available" does
-  # not imply "WebEngine available" (OBS Flatpak / dependency bundles).
-  # Without it the plugin still builds; the login dialog reports that
-  # WebEngine packaging is missing instead of offering login.
-  find_package(Qt6 COMPONENTS WebEngineCore WebEngineWidgets)
-  if(Qt6WebEngineWidgets_FOUND)
+  # Qt WebEngine provides the embedded TikTok login browser. Release
+  # builds keep ENABLE_TIKTOK_LOGIN=ON and therefore fail here if the
+  # OBS/Qt bundle cannot provide a functional WebEngine runtime.
+  # Minimal/development builds may set ENABLE_TIKTOK_LOGIN=OFF.
+  if(ENABLE_TIKTOK_LOGIN)
+    find_package(Qt6 REQUIRED COMPONENTS WebEngineCore WebEngineWidgets)
     target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
     target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WITH_TIKTOK_WEBENGINE=1)
-    message(STATUS "obs-multi-rtmp: Qt WebEngine found, embedded TikTok login enabled")
+    message(STATUS "obs-multi-rtmp: embedded TikTok login enabled")
   else()
-    message(WARNING "obs-multi-rtmp: Qt WebEngine NOT found, TikTok login dialog will be unavailable")
+    message(STATUS "obs-multi-rtmp: embedded TikTok login disabled")
   endif()
   target_compile_options(
     ${CMAKE_PROJECT_NAME}
@@ -52,6 +69,10 @@ if(ENABLE_QT)
     ${CMAKE_PROJECT_NAME}
     PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
   )
+endif()
+
+if(NOT ENABLE_QT AND ENABLE_TIKTOK_LOGIN)
+  message(WARNING "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN requires ENABLE_QT; embedded login will be unavailable")
 endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
@@ -92,6 +113,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   ./src/tiktok/auth-dialog.cpp
   ./src/tiktok/auth-manager.h
   ./src/tiktok/auth-manager.cpp
+  ./src/tiktok/worker.h
+  ./src/tiktok/worker.cpp
+  ./src/tiktok/cleanup.h
+  ./src/tiktok/cleanup.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -106,9 +131,9 @@ if(WIN32)
 elseif(APPLE)
   # macOS Keychain Services.
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "-framework Security" "-framework CoreFoundation")
-else()
-  # Linux Secret Service backend loads libsecret with dlopen.
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
+elseif(TIKTOK_HAVE_LIBSECRET)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::LIBSECRET)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE TIKTOK_USE_LIBSECRET=1)
 endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
@@ -130,10 +155,17 @@ if(BUILD_TESTING)
     target_link_libraries(test-tiktok-credential-store PRIVATE "-framework Security" "-framework CoreFoundation")
   elseif(WIN32)
     target_link_libraries(test-tiktok-credential-store PRIVATE Advapi32)
-  else()
-    target_link_libraries(test-tiktok-credential-store PRIVATE ${CMAKE_DL_LIBS})
+  elseif(TIKTOK_HAVE_LIBSECRET)
+    target_link_libraries(test-tiktok-credential-store PRIVATE PkgConfig::LIBSECRET)
+    target_compile_definitions(test-tiktok-credential-store PRIVATE TIKTOK_USE_LIBSECRET=1)
   endif()
   add_test(NAME tiktok-credential-store COMMAND test-tiktok-credential-store)
+
+  find_package(Threads REQUIRED)
+  add_executable(test-tiktok-cleanup ./tests/test-tiktok-cleanup.cpp ./src/tiktok/cleanup.cpp)
+  target_include_directories(test-tiktok-cleanup PRIVATE ./src)
+  target_link_libraries(test-tiktok-cleanup PRIVATE Threads::Threads)
+  add_test(NAME tiktok-cleanup COMMAND test-tiktok-cleanup)
 
   # Qt-based pure-logic tests (no WebEngine, no OBS needed).
   find_package(Qt6 COMPONENTS Core QUIET)

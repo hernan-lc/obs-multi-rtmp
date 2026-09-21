@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <thread>
 
 #include "output-config.h"
 #include "streamlabs-tiktok.h"
@@ -23,6 +22,7 @@
 #include "tiktok/credential-store.h"
 #include "tiktok/exchange.h"
 #include "tiktok/streamlabs-client.h"
+#include "tiktok/worker.h"
 
 namespace {
 
@@ -32,23 +32,31 @@ constexpr int kOverallTimeoutMs = 10 * 60 * 1000;
 constexpr int kTikTokRecheckDelayMs = 1500;
 constexpr int kAccessRefreshMs = 15 * 60 * 1000;
 constexpr int kMinRefreshGapSec = 60;
+constexpr int kMigrationRetryMs = 30000;
+constexpr int kMaxMigrationRetries = 3;
 
-std::atomic<int> g_liveActivity{0};
+std::atomic<int> g_activeLives{0};
+
+// Serializes credential-store saves against compare-and-delete removals
+// (worker threads only; the UI thread merely submits jobs). The store
+// holds a single entry, so without this a stale removal landing after a
+// newer login's save would destroy the live credential.
+std::mutex g_storeMutex;
 
 } // namespace
 
 namespace TikTokLiveRegistry {
-void registerActivity()
+void addLive()
 {
-    g_liveActivity.fetch_add(1);
+    g_activeLives.fetch_add(1);
 }
-void unregisterActivity()
+void removeLive()
 {
-    g_liveActivity.fetch_sub(1);
+    g_activeLives.fetch_sub(1);
 }
 bool hasActiveActivity()
 {
-    return g_liveActivity.load() > 0;
+    return g_activeLives.load() > 0 || TikTokWorkerService::instance().hasActiveActivity();
 }
 } // namespace TikTokLiveRegistry
 
@@ -200,68 +208,99 @@ void TikTokAuthManager::restoreSession()
     blog(LOG_INFO, TAG "TikTok: restoring saved session");
     setStatus(Status::Validating);
 
-    std::thread([this, restoreId]() {
-        std::optional<std::string> stored = activeStore_->load();
-        const bool haveToken = stored.has_value() && !stored->empty();
+    struct RestoreOutcome {
+        std::optional<std::string> stored;
         TikTokAccountResult validation;
-        if (haveToken) {
-            StreamlabsTikTokClient probe(*stored);
-            validation = probe.GetAccountInfo();
-        }
-        QMetaObject::invokeMethod(
-            this,
-            [this, restoreId, stored = std::move(stored), haveToken,
-             validation = std::move(validation)]() {
+    };
+    auto outcome = std::make_shared<RestoreOutcome>();
+    ICredentialStore *store = activeStore_;
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [store, outcome](const std::shared_ptr<TikTokJobContext> &) {
+            outcome->stored = store->load();
+            if (outcome->stored.has_value() && !outcome->stored->empty()) {
+                StreamlabsTikTokClient probe(*outcome->stored);
+                outcome->validation = probe.GetAccountInfo();
+            }
+        },
+        [this, restoreId, outcome](const std::shared_ptr<TikTokJobContext> &) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (restoreId != restoreGen_)
+                    return;
+                restoring_ = false;
+            }
+            const bool haveToken = outcome->stored.has_value() && !outcome->stored->empty();
+            if (!haveToken) {
+                blog(LOG_INFO, TAG "TikTok: no saved credential");
+                setStatus(Status::LoggedOut);
+                pumpLegacyMigration();
+                return;
+            }
+            switch (ClassifyCredentialResult(outcome->validation)) {
+            case CredentialValidation::Valid: {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (restoreId != restoreGen_)
-                        return;
-                    restoring_ = false;
+                    token_ = *outcome->stored;
+                    account_ = outcome->validation.account;
+                    authEpoch_++;
                 }
-                if (!haveToken) {
-                    blog(LOG_INFO, TAG "TikTok: no saved credential");
-                    setStatus(Status::LoggedOut);
-                    pumpLegacyMigration();
-                    return;
-                }
-                if (validation.success) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        token_ = *stored;
-                        account_ = validation.account;
-                        authEpoch_++;
-                    }
-                    blog(LOG_INFO, TAG "TikTok: session restored");
-                    setStatus(Status::Authenticated);
-                    emit loginSucceeded();
-                    scheduleAccessRefresh();
-                    return;
-                }
-                if (validation.failure == TikTokFailure::Auth ||
-                    validation.failure == TikTokFailure::Forbidden) {
-                    blog(LOG_INFO, TAG "TikTok: saved credential rejected, removing");
-                    activeStore_->remove();
-                    memoryStore_->remove();
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        token_.clear();
-                        account_.reset();
-                        authEpoch_++;
-                    }
-                    setStatus(Status::SessionExpired);
-                    return;
-                }
-                // Temporary failure: retain the credential, status unknown.
-                blog(LOG_INFO, TAG "TikTok: validation deferred (temporary failure)");
+                blog(LOG_INFO, TAG "TikTok: session restored");
+                setStatus(Status::Authenticated);
+                emit loginSucceeded();
+                scheduleAccessRefresh();
+                return;
+            }
+            case CredentialValidation::ValidLiveForbidden: {
+                // 403: the credential stays saved and the session stays
+                // authenticated; only LIVE eligibility is marked false.
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    token_ = *stored;
+                    token_ = *outcome->stored;
+                    account_ = TikTokAccountInfo{};
+                    account_->liveEligibilityKnown = true;
+                    account_->canGoLive = false;
+                    authEpoch_++;
+                }
+                blog(LOG_INFO, TAG "TikTok: session restored without LIVE access (HTTP 403)");
+                setStatus(Status::Authenticated);
+                emit loginSucceeded();
+                scheduleAccessRefresh();
+                return;
+            }
+            case CredentialValidation::InvalidCredential: {
+                blog(LOG_INFO, TAG "TikTok: saved credential rejected, removing");
+                const std::string rejected = *outcome->stored;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    token_.clear();
                     account_.reset();
+                    authEpoch_++;
                 }
-                setStatus(Status::NetworkUnknown);
-            },
-            Qt::QueuedConnection);
-    }).detach();
+                removeStoredCredentialAsync(rejected);
+                setStatus(Status::SessionExpired);
+                return;
+            }
+            case CredentialValidation::TemporaryFailure:
+                break;
+            }
+            // Temporary failure: retain the credential, status unknown.
+            blog(LOG_INFO, TAG "TikTok: validation deferred (temporary failure)");
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                token_ = *outcome->stored;
+                account_.reset();
+            }
+            setStatus(Status::NetworkUnknown);
+        },
+        false);
+    if (!job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            restoring_ = false;
+        }
+        setStatus(Status::LoggedOut);
+    }
 }
 
 void TikTokAuthManager::migrateLegacyTokens(std::vector<std::string> tokens)
@@ -301,47 +340,68 @@ void TikTokAuthManager::pumpLegacyMigration()
     blog(LOG_INFO, TAG "TikTok: migrating legacy token");
     setStatus(Status::Validating);
 
-    std::thread([this, candidate = std::move(candidate)]() {
-        StreamlabsTikTokClient probe(candidate);
-        TikTokAccountResult validation = probe.GetAccountInfo();
-        QMetaObject::invokeMethod(
-            this,
-            [this, candidate = std::move(candidate), validation = std::move(validation)]() {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    restoring_ = false;
+    auto validation = std::make_shared<TikTokAccountResult>();
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [candidate, validation](const std::shared_ptr<TikTokJobContext> &) {
+            StreamlabsTikTokClient probe(candidate);
+            *validation = probe.GetAccountInfo();
+        },
+        [this, candidate, validation](const std::shared_ptr<TikTokJobContext> &) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                restoring_ = false;
+            }
+            switch (ClassifyCredentialResult(*validation)) {
+            case CredentialValidation::Valid:
+            case CredentialValidation::ValidLiveForbidden: {
+                // 403 migrates too: the credential is kept and the
+                // session authenticates without LIVE access.
+                TikTokAccountInfo account = validation->account;
+                if (!validation->success) {
+                    account = TikTokAccountInfo{};
+                    account.liveEligibilityKnown = true;
+                    account.canGoLive = false;
                 }
-                if (validation.success) {
-                    const bool saved = activeStore_->save(candidate);
-                    if (!saved && activeStore_ != memoryStore_.get()) {
-                        memoryStore_->save(candidate);
-                        activeStore_ = memoryStore_.get();
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        token_ = candidate;
-                        account_ = validation.account;
-                        authEpoch_++;
-                    }
-                    blog(LOG_INFO, TAG "TikTok: legacy token migrated");
-                    SaveMultiOutputConfig();
-                    setStatus(Status::Authenticated);
-                    emit loginSucceeded();
-                    scheduleAccessRefresh();
-                    if (!secureStoragePersistent()) {
-                        QMessageBox::warning(
-                            nullptr, QString::fromUtf8(obs_module_text("TikTok.Settings")),
-                            QString::fromUtf8(
-                                obs_module_text("TikTok.SecureStorageUnavailable")));
-                    }
-                    return;
-                }
+                saveMigratedCredential(candidate, account);
+                return;
+            }
+            case CredentialValidation::InvalidCredential:
                 blog(LOG_INFO, TAG "TikTok: legacy token invalid, requiring login");
                 SaveMultiOutputConfig();
                 setStatus(Status::LoggedOut);
-            },
-            Qt::QueuedConnection);
-    }).detach();
+                return;
+            case CredentialValidation::TemporaryFailure:
+                break;
+            }
+            // Transient failure: keep the candidate for a bounded retry
+            // instead of destroying a possibly good token.
+            int retries = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pendingLegacy_.insert(pendingLegacy_.begin(), candidate);
+                retries = ++migrationRetries_;
+            }
+            if (retries > kMaxMigrationRetries) {
+                blog(LOG_INFO, TAG "TikTok: legacy migration gave up after transient failures");
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    pendingLegacy_.clear();
+                }
+                SaveMultiOutputConfig();
+                setStatus(Status::LoggedOut);
+                return;
+            }
+            blog(LOG_INFO, TAG "TikTok: legacy migration deferred (temporary failure)");
+            setStatus(Status::NetworkUnknown);
+            QTimer::singleShot(kMigrationRetryMs, this, [this]() { pumpLegacyMigration(); });
+        },
+        false);
+    if (!job) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pendingLegacy_.insert(pendingLegacy_.begin(), candidate);
+        restoring_ = false;
+    }
 }
 
 void TikTokAuthManager::login(QWidget *parent)
@@ -495,11 +555,10 @@ void TikTokAuthManager::logout(QWidget *parent)
         applyDialog_->close();
     }
     flow_.reset();
-    if (secureStore_)
-        secureStore_->remove();
-    memoryStore_->remove();
+    std::string dropped;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        dropped = token_;
         token_.clear();
         account_.reset();
         authEpoch_++;
@@ -507,6 +566,9 @@ void TikTokAuthManager::logout(QWidget *parent)
         reauthing_ = false;
         applyOpened_ = false;
     }
+    // Secure-store I/O blocks on IPC: persist the removal off-UI. The
+    // compare-and-delete keeps a newer login's credential safe.
+    removeStoredCredentialAsync(dropped);
     TikTokAuthDialog::clearPersistentData();
     blog(LOG_INFO, TAG "TikTok: logged out");
     setStatus(Status::LoggedOut);
@@ -515,18 +577,18 @@ void TikTokAuthManager::logout(QWidget *parent)
 
 void TikTokAuthManager::handleAuthFailure(uint64_t epoch)
 {
+    std::string rejected;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (epoch != authEpoch_ || token_.empty())
             return;
+        rejected = token_;
         token_.clear();
         account_.reset();
         authEpoch_++;
         applyOpened_ = false;
     }
-    if (secureStore_)
-        secureStore_->remove();
-    memoryStore_->remove();
+    removeStoredCredentialAsync(rejected);
     if (refreshTimer_)
         refreshTimer_->stop();
     blog(LOG_INFO, TAG "TikTok: session expired (credential rejected)");
@@ -582,49 +644,151 @@ void TikTokAuthManager::refreshAccessState()
         token = token_;
         epoch = authEpoch_;
     }
-    std::thread([this, token = std::move(token), epoch]() {
-        StreamlabsTikTokClient probe(token);
-        TikTokAccountResult result = probe.GetAccountInfo();
-        QMetaObject::invokeMethod(
-            this,
-            [this, result = std::move(result), epoch]() mutable {
+    auto result = std::make_shared<TikTokAccountResult>();
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [token = std::move(token), result](const std::shared_ptr<TikTokJobContext> &) {
+            StreamlabsTikTokClient probe(token);
+            *result = probe.GetAccountInfo();
+        },
+        [this, result, epoch](const std::shared_ptr<TikTokJobContext> &) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                refreshing_ = false;
+                if (epoch != authEpoch_)
+                    return; // stale: a newer session exists
+                lastRefresh_ = std::chrono::steady_clock::now();
+            }
+            switch (ClassifyCredentialResult(*result)) {
+            case CredentialValidation::Valid: {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    refreshing_ = false;
-                    if (epoch != authEpoch_)
-                        return; // stale: a newer session exists
-                    lastRefresh_ = std::chrono::steady_clock::now();
-                }
-                if (result.success) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        if (account_.has_value() && !result.account.liveEligibilityKnown &&
-                            account_->liveEligibilityKnown) {
-                            // A refresh without eligibility fields must not
-                            // wipe a positively observed state.
-                            result.account.liveEligibilityKnown = true;
-                            result.account.canGoLive = account_->canGoLive;
-                            result.account.liveUnavailableReason =
-                                account_->liveUnavailableReason;
-                            if (result.account.applicationStatus.empty())
-                                result.account.applicationStatus =
-                                    account_->applicationStatus;
-                        }
-                        account_ = result.account;
-                        if (account_->liveEligibilityKnown && account_->canGoLive)
-                            applyOpened_ = false;
+                    if (account_.has_value() && !result->account.liveEligibilityKnown &&
+                        account_->liveEligibilityKnown) {
+                        // A refresh without eligibility fields must not
+                        // wipe a positively observed state.
+                        result->account.liveEligibilityKnown = true;
+                        result->account.canGoLive = account_->canGoLive;
+                        result->account.liveUnavailableReason =
+                            account_->liveUnavailableReason;
+                        if (result->account.applicationStatus.empty())
+                            result->account.applicationStatus =
+                                account_->applicationStatus;
                     }
-                    emit authenticationChanged();
-                    return;
+                    account_ = result->account;
+                    if (account_->liveEligibilityKnown && account_->canGoLive)
+                        applyOpened_ = false;
                 }
-                if (result.failure == TikTokFailure::Auth)
-                    handleAuthFailure(epoch);
-                else if (result.failure == TikTokFailure::Forbidden)
-                    noteLiveAccessDenied(epoch);
+                emit authenticationChanged();
+                return;
+            }
+            case CredentialValidation::ValidLiveForbidden:
+                noteLiveAccessDenied(epoch);
+                return;
+            case CredentialValidation::InvalidCredential:
+                handleAuthFailure(epoch);
+                return;
+            case CredentialValidation::TemporaryFailure:
                 // Transient failures: keep everything, the timer retries.
-            },
-            Qt::QueuedConnection);
-    }).detach();
+                return;
+            }
+        },
+        false);
+    if (!job) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refreshing_ = false;
+    }
+}
+
+bool TikTokAuthManager::credentialEpochCurrent(uint64_t epoch) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return epoch == authEpoch_;
+}
+
+void TikTokAuthManager::removeStoredCredentialAsync(std::string expectedToken)
+{
+    ICredentialStore *secure = secureStore_ ? secureStore_.get() : nullptr;
+    ICredentialStore *memory = memoryStore_.get();
+    TikTokWorkerService::instance().submit(
+        this,
+        [secure, memory, expectedToken = std::move(expectedToken)](
+            const std::shared_ptr<TikTokJobContext> &) {
+            // Serialized with async saves: the load-compare-remove is
+            // atomic against a newer login persisting its credential, so
+            // a stale removal can never destroy the live credential.
+            std::lock_guard<std::mutex> lock(g_storeMutex);
+            ICredentialStore *stores[] = {secure, memory};
+            for (ICredentialStore *store : stores) {
+                if (store == nullptr)
+                    continue;
+                if (!expectedToken.empty()) {
+                    const auto stored = store->load();
+                    if (!stored.has_value() || *stored != expectedToken)
+                        continue;
+                }
+                store->remove();
+            }
+        },
+        TikTokWorkerService::Done(), false);
+}
+
+void TikTokAuthManager::saveMigratedCredential(const std::string &candidate,
+                                              const TikTokAccountInfo &account)
+{
+    ICredentialStore *primary = secureStore_ ? secureStore_.get() : memoryStore_.get();
+    ICredentialStore *memory = memoryStore_.get();
+    uint64_t epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        epoch = authEpoch_;
+    }
+    struct SaveOutcome {
+        bool secureSaved = false;
+        bool memorySaved = false;
+    };
+    auto outcome = std::make_shared<SaveOutcome>();
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [this, primary, memory, candidate, outcome, epoch](const std::shared_ptr<TikTokJobContext> &) {
+            if (!credentialEpochCurrent(epoch))
+                return;
+            std::lock_guard<std::mutex> lock(g_storeMutex);
+            outcome->secureSaved = primary->save(candidate);
+            if (!outcome->secureSaved && primary != memory)
+                outcome->memorySaved = memory->save(candidate);
+        },
+        [this, candidate, account, outcome, epoch](const std::shared_ptr<TikTokJobContext> &) {
+            if (!credentialEpochCurrent(epoch)) {
+                // Superseded after our save landed: drop only our own
+                // value, never a newer session's credential.
+                removeStoredCredentialAsync(candidate);
+                return;
+            }
+            if (outcome->secureSaved && secureStore_ != nullptr)
+                activeStore_ = secureStore_.get();
+            else
+                activeStore_ = memoryStore_.get();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                token_ = candidate;
+                account_ = account;
+                authEpoch_++;
+                migrationRetries_ = 0;
+            }
+            blog(LOG_INFO, TAG "TikTok: legacy token migrated");
+            SaveMultiOutputConfig();
+            setStatus(Status::Authenticated);
+            emit loginSucceeded();
+            scheduleAccessRefresh();
+            if (!secureStoragePersistent()) {
+                QMessageBox::warning(nullptr, QString::fromUtf8(obs_module_text("TikTok.Settings")),
+                                     QString::fromUtf8(obs_module_text("TikTok.SecureStorageUnavailable")));
+            }
+        },
+        false);
+    if (!job)
+        blog(LOG_INFO, TAG "TikTok: legacy migration dropped during shutdown");
 }
 
 void TikTokAuthManager::scheduleAccessRefresh()
@@ -812,34 +976,54 @@ void TikTokAuthManager::validateCandidateOnWorker(uint64_t attempt, std::string 
                                                  bool isReauth)
 {
     setStatus(Status::Validating);
-    std::thread([this, attempt, candidateToken = std::move(candidateToken), isReauth]() {
-        StreamlabsTikTokClient probe(candidateToken);
-        TikTokAccountResult validation = probe.GetAccountInfo();
-        QMetaObject::invokeMethod(
-            this,
-            [this, attempt, candidateToken = std::move(candidateToken),
-             validation = std::move(validation), isReauth]() {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (!loginActive_ || attempt != loginAttempt_)
-                        return; // superseded: discard candidate
-                }
-                if (validation.success) {
-                    acceptValidatedLogin(attempt, candidateToken, validation);
-                    return;
-                }
-                QString message;
-                if (validation.failure == TikTokFailure::Network ||
-                    validation.failure == TikTokFailure::Timeout) {
-                    message = QString::fromUtf8(obs_module_text("Error.TikTokNetwork"));
-                } else {
-                    message = QString::fromUtf8(obs_module_text("TikTok.LoginFailed"));
-                }
-                Q_UNUSED(isReauth);
-                finishLoginAttempt(attempt, message);
-            },
-            Qt::QueuedConnection);
-    }).detach();
+    auto validation = std::make_shared<TikTokAccountResult>();
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [candidateToken, validation](const std::shared_ptr<TikTokJobContext> &) {
+            StreamlabsTikTokClient probe(candidateToken);
+            *validation = probe.GetAccountInfo();
+        },
+        [this, attempt, candidateToken = std::move(candidateToken), validation, isReauth](
+            const std::shared_ptr<TikTokJobContext> &) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!loginActive_ || attempt != loginAttempt_)
+                    return; // superseded: discard candidate
+            }
+            switch (ClassifyCredentialResult(*validation)) {
+            case CredentialValidation::Valid:
+                acceptValidatedLogin(attempt, candidateToken, *validation);
+                return;
+            case CredentialValidation::ValidLiveForbidden: {
+                // 403: the credential is valid, the account just lacks
+                // LIVE access. Authenticate without eligibility.
+                TikTokAccountResult account;
+                account.success = true;
+                account.account.liveEligibilityKnown = true;
+                account.account.canGoLive = false;
+                acceptValidatedLogin(attempt, candidateToken, account);
+                return;
+            }
+            case CredentialValidation::InvalidCredential:
+            case CredentialValidation::TemporaryFailure:
+                break;
+            }
+            QString message;
+            if (validation->failure == TikTokFailure::Network ||
+                validation->failure == TikTokFailure::Timeout) {
+                message = QString::fromUtf8(obs_module_text("Error.TikTokNetwork"));
+            } else {
+                message = QString::fromUtf8(obs_module_text("TikTok.LoginFailed"));
+            }
+            Q_UNUSED(isReauth);
+            finishLoginAttempt(attempt, message);
+        },
+        false);
+    if (!job) {
+        // Shutdown raced validation: drop the attempt silently. A
+        // re-login keeps its previous session via finishLoginAttempt.
+        finishLoginAttempt(attempt, QString());
+    }
 }
 
 void TikTokAuthManager::acceptValidatedLogin(uint64_t attempt, const std::string &candidateToken,
@@ -850,35 +1034,75 @@ void TikTokAuthManager::acceptValidatedLogin(uint64_t attempt, const std::string
         if (!loginActive_ || attempt != loginAttempt_)
             return;
     }
-    const bool secureSaved = activeStore_->save(candidateToken);
-    bool memoryFallback = false;
-    if (!secureSaved && activeStore_ != memoryStore_.get()) {
-        memoryFallback = memoryStore_->save(candidateToken);
-        if (memoryFallback)
-            activeStore_ = memoryStore_.get();
-    }
+    // The candidate validated: persist it off-UI (secure-store I/O blocks
+    // on IPC), then complete the login from the save continuation.
+    saveLoginCredential(attempt, candidateToken, std::move(account));
+}
+
+void TikTokAuthManager::saveLoginCredential(uint64_t attempt, const std::string &candidateToken,
+                                           TikTokAccountResult account)
+{
+    ICredentialStore *primary = secureStore_ ? secureStore_.get() : memoryStore_.get();
+    ICredentialStore *memory = memoryStore_.get();
     QWidget *notifyParent = dialog_ ? dialog_->parentWidget() : nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        token_ = candidateToken;
-        account_ = account.account;
-        authEpoch_++;
-        loginActive_ = false;
-        reauthing_ = false;
-        // A new account may have signed in; pending memory belongs to
-        // the previous session.
-        applyOpened_ = false;
-    }
-    stopLoginTimers();
-    teardownDialog();
-    flow_.reset();
-    blog(LOG_INFO, TAG "TikTok: login succeeded");
-    setStatus(Status::Authenticated);
-    emit loginSucceeded();
-    scheduleAccessRefresh();
-    if (!secureStoragePersistent()) {
-        QMessageBox::warning(notifyParent, QString::fromUtf8(obs_module_text("TikTok.Settings")),
-                             QString::fromUtf8(obs_module_text("TikTok.SecureStorageUnavailable")));
+    struct SaveOutcome {
+        bool secureSaved = false;
+    };
+    auto outcome = std::make_shared<SaveOutcome>();
+    auto job = TikTokWorkerService::instance().submit(
+        this,
+        [primary, memory, candidateToken, outcome](const std::shared_ptr<TikTokJobContext> &) {
+            std::lock_guard<std::mutex> lock(g_storeMutex);
+            outcome->secureSaved = primary->save(candidateToken);
+            if (!outcome->secureSaved && primary != memory)
+                memory->save(candidateToken);
+        },
+        [this, attempt, candidateToken, account = std::move(account), outcome, notifyParent](
+            const std::shared_ptr<TikTokJobContext> &) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!loginActive_ || attempt != loginAttempt_) {
+                    // Superseded (logout/cancel raced the save) after our
+                    // save landed: drop only our own value, never a newer
+                    // session's credential.
+                    removeStoredCredentialAsync(candidateToken);
+                    return;
+                }
+            }
+            if (outcome->secureSaved && secureStore_ != nullptr)
+                activeStore_ = secureStore_.get();
+            else
+                activeStore_ = memoryStore_.get();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                token_ = candidateToken;
+                account_ = account.account;
+                authEpoch_++;
+                loginActive_ = false;
+                reauthing_ = false;
+                // A new account may have signed in; pending memory belongs to
+                // the previous session.
+                applyOpened_ = false;
+            }
+            stopLoginTimers();
+            teardownDialog();
+            flow_.reset();
+            blog(LOG_INFO, TAG "TikTok: login succeeded");
+            setStatus(Status::Authenticated);
+            emit loginSucceeded();
+            scheduleAccessRefresh();
+            if (!secureStoragePersistent()) {
+                QMessageBox::warning(notifyParent,
+                                     QString::fromUtf8(obs_module_text("TikTok.Settings")),
+                                     QString::fromUtf8(
+                                         obs_module_text("TikTok.SecureStorageUnavailable")));
+            }
+        },
+        false);
+    if (!job) {
+        // Shutdown raced the save: drop the attempt silently. A
+        // re-login keeps its previous session via finishLoginAttempt.
+        finishLoginAttempt(attempt, QString());
     }
 }
 
@@ -894,6 +1118,9 @@ void TikTokAuthManager::finishLoginAttempt(uint64_t attempt, const QString &erro
         reauthing_ = false;
     }
     stopLoginTimers();
+    // Scrub the live WebView session before teardown so a failed or
+    // cancelled attempt cannot re-persist its cookies on destruction.
+    scrubDialogSession();
     teardownDialog();
     flow_.reset();
     if (keepOld) {
@@ -945,4 +1172,27 @@ void TikTokAuthManager::scrubDialogSession()
 {
     if (dialog_)
         dialog_->clearSessionData();
+}
+
+void TikTokAuthManager::shutdown()
+{
+    stopLoginTimers();
+    if (refreshTimer_)
+        refreshTimer_->stop();
+    // Invalidate every in-flight attempt first: any completion that
+    // still runs finds loginActive_ cleared and discards its candidate.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        loginActive_ = false;
+        reauthing_ = false;
+        restoring_ = false;
+        refreshing_ = false;
+    }
+    teardownDialog();
+    if (applyDialog_)
+        applyDialog_->close();
+    flow_.reset();
+    // Joins every worker thread (cancelling normal jobs, running cleanup
+    // jobs to completion), so no plugin code runs after module unload.
+    TikTokWorkerService::instance().shutdown();
 }

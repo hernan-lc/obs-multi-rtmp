@@ -19,9 +19,10 @@
 #include <string>
 
 // Starter script for one authorization code. Runs synchronously and
-// returns 'started' (or 'kept' when a previous accepted result must
-// not be clobbered). Both dynamic values travel as JSON string
-// literals, never raw interpolation.
+// returns 'started', 'kept' (a previous accepted result must not be
+// clobbered), or 'wrong-page' (executing document is not the expected
+// Streamlabs success page, so no fetch is attempted). Both dynamic
+// values travel as JSON string literals, never raw interpolation.
 std::string BuildExchangeStartJs(const std::string &exchangeUrl, const std::string &expectedPage);
 
 // Poll script: returns the accepted outcome object, or null while the

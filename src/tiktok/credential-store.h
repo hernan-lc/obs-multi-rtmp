@@ -4,7 +4,8 @@
 // must never live in obs-multi-rtmp.json, logs, or target configuration.
 //
 // Platform backends:
-//   Linux:   Secret Service via libsecret (dlopen, no hard link dep)
+//   Linux:   Secret Service via linked libsecret when available,
+//            otherwise memory-only
 //   Windows: Windows Credential Manager
 //   macOS:   Keychain Services
 //

@@ -114,6 +114,18 @@ static int TestScriptBuilders()
     return 0;
 }
 
+static int TestExchangePageFence()
+{
+    const std::string starter = BuildExchangeStartJs("https://streamlabs.com/api/v5/slobs/auth/data", "h/p");
+    const size_t pageCheck = starter.find("if (P !== EP) return 'wrong-page';");
+    const size_t fetchCall = starter.find("fetch(");
+    CHECK(pageCheck != std::string::npos);
+    CHECK(fetchCall != std::string::npos);
+    CHECK(pageCheck < fetchCall);
+    CHECK(starter.find("window.__multirtmp_tiktok_exchange_seq", pageCheck) != std::string::npos);
+    return 0;
+}
+
 int main()
 {
     if (TestPendingPayloads())
@@ -125,6 +137,8 @@ int main()
     if (TestErrorSanitizing())
         return 1;
     if (TestScriptBuilders())
+        return 1;
+    if (TestExchangePageFence())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;

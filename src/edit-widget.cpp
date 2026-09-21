@@ -5,13 +5,13 @@
 #include "streamlabs-tiktok.h"
 #include "tiktok/auth-manager.h"
 #include "tiktok/streamlabs-client.h"
+#include "tiktok/worker.h"
 #include <QMenu>
 #include <QTabWidget>
 #include <qevent.h>
 #include <QComboBox>
 
 #include <regex>
-#include <thread>
 
 #include "obs-properties-widget.h"
 #include "helpers.h"
@@ -494,6 +494,13 @@ protected:
     }
 
 public:
+    ~EditOutputWidgetImpl() override
+    {
+        // Orphan in-flight category searches: their completions are
+        // dropped while workers finish harmlessly on pool threads.
+        TikTokWorkerService::instance().cancelReceiver(this);
+    }
+
     EditOutputWidgetImpl(const std::string& targetid, QWidget* parent = 0)
         : QDialog(parent)
         , targetid_(targetid)
@@ -1127,37 +1134,54 @@ public:
         if (query.size() < 2)
             return;
         const uint64_t gen = ++tiktokCategoryGen_;
-        // Queued back to this dialog: if it is destroyed first, the
-        // callback is dropped and the stale-generation check covers
-        // superseded searches.
-        std::thread([this, client, query, gen]() {
-            auto result = client->SearchCategories(query);
-            QMetaObject::invokeMethod(
-                this,
-                [this, result = std::move(result), gen, epoch = client->authEpoch()]() {
-                    if (gen != tiktokCategoryGen_ || !tiktokCategory_)
-                        return;
-                    if (!result.success) {
-                        if (result.failure == TikTokFailure::Auth)
-                            TikTokAuthManager::instance().handleAuthFailure(epoch);
-                        else if (result.failure == TikTokFailure::Forbidden)
-                            TikTokAuthManager::instance().noteLiveAccessDenied(epoch);
-                        return;
-                    }
-                    const QString current = tiktokCategory_->currentText();
-                    tiktokCategory_->blockSignals(true);
-                    tiktokCategory_->clear();
-                    for (const auto &entry : result.categories) {
-                        tiktokCategory_->addItem(QString::fromUtf8(entry.fullName),
-                                                 QString::fromUtf8(entry.gameMaskId));
-                    }
-                    tiktokCategory_->setEditText(current);
-                    tiktokCategory_->blockSignals(false);
-                    if (!result.categories.empty() && tiktokCategory_->hasFocus())
-                        tiktokCategory_->showPopup();
-                },
-                Qt::QueuedConnection);
-        }).detach();
+        auto result = std::make_shared<TikTokCategoryListResult>();
+        // Managed job: no raw this crosses threads. Destroying the
+        // dialog orphans the job (completion dropped); the generation
+        // check covers superseded searches.
+        TikTokWorkerService::instance().submit(
+            this,
+            [client, query, result](const std::shared_ptr<TikTokJobContext> &) {
+                *result = client->SearchCategories(query);
+            },
+            [result, gen, epoch = client->authEpoch()](const std::shared_ptr<TikTokJobContext> &job) {
+                // dynamic_cast: QObject is a virtual base of QWidget, so
+                // static_cast cannot downcast here.
+                auto *self = dynamic_cast<EditOutputWidgetImpl *>(job->receiver.data());
+                if (self == nullptr)
+                    return;
+                self->ApplyTikTokCategories(gen, *result, epoch);
+            },
+            false);
+    }
+
+    void ApplyTikTokCategories(uint64_t gen, const TikTokCategoryListResult &result, uint64_t epoch)
+    {
+        if (gen != tiktokCategoryGen_ || !tiktokCategory_)
+            return;
+        if (!result.success) {
+            switch (ClassifyCredentialResult(result)) {
+            case CredentialValidation::InvalidCredential:
+                TikTokAuthManager::instance().handleAuthFailure(epoch);
+                break;
+            case CredentialValidation::ValidLiveForbidden:
+                TikTokAuthManager::instance().noteLiveAccessDenied(epoch);
+                break;
+            default:
+                break;
+            }
+            return;
+        }
+        const QString current = tiktokCategory_->currentText();
+        tiktokCategory_->blockSignals(true);
+        tiktokCategory_->clear();
+        for (const auto &entry : result.categories) {
+            tiktokCategory_->addItem(QString::fromUtf8(entry.fullName),
+                                     QString::fromUtf8(entry.gameMaskId));
+        }
+        tiktokCategory_->setEditText(current);
+        tiktokCategory_->blockSignals(false);
+        if (!result.categories.empty() && tiktokCategory_->hasFocus())
+            tiktokCategory_->showPopup();
     }
 
     using IdOrVideoConfig = std::variant<std::string_view, VideoEncoderConfig*>;

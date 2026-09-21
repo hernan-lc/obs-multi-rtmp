@@ -35,13 +35,13 @@ class TikTokAuthFlow;
 class QTimer;
 class QWidget;
 
-// Tracks in-flight TikTok activity (async start preparation + active LIVE
-// sessions) so logout cannot orphan a session or race a pending start.
-// Push widgets register on preparation start and unregister when the LIVE
-// is ended or preparation settles.
+// True while real TikTok work is outstanding: managed worker jobs
+// (preparation/cleanup, including cancelled-but-still-running ones) or
+// stored active LIVE sessions. Logout stays blocked until both drain,
+// so it can neither orphan a session nor race a pending start/end.
 namespace TikTokLiveRegistry {
-void registerActivity();
-void unregisterActivity();
+void addLive();
+void removeLive();
 bool hasActiveActivity();
 } // namespace TikTokLiveRegistry
 
@@ -120,6 +120,10 @@ public:
     // replace the stored credential. Never logs tokens.
     void migrateLegacyTokens(std::vector<std::string> tokens);
 
+    // Plugin shutdown: stops timers and joins every TikTok worker
+    // thread. Called from obs_module_unload; safe to call twice.
+    void shutdown();
+
 signals:
     void authenticationChanged();
     void stateChanged();
@@ -139,6 +143,8 @@ private:
     void finishLoginAttempt(uint64_t attempt, const QString &error);
     void acceptValidatedLogin(uint64_t attempt, const std::string &candidateToken,
                               TikTokAccountResult account);
+    void saveLoginCredential(uint64_t attempt, const std::string &candidateToken,
+                             TikTokAccountResult account);
     void validateCandidateOnWorker(uint64_t attempt, std::string candidateToken, bool isReauth);
     void startExchange(uint64_t attempt, const QString &code, const QString &expectedPage);
     void runExchangeStarter(uint64_t attempt);
@@ -152,6 +158,14 @@ private:
     void onApplyUrl(const QUrl &url);
     void onApplyClosed();
     void scheduleAccessRefresh();
+    void saveMigratedCredential(const std::string &candidate, const TikTokAccountInfo &account);
+    // Store removal on a worker thread (secure-store I/O blocks on IPC
+    // and must never run on the UI thread). Deletes only when the store
+    // still holds expectedToken, so a stale removal can never destroy a
+    // newer session's credential. Callers clear memory state and bump the
+    // epoch first; an empty expectation removes unconditionally.
+    void removeStoredCredentialAsync(std::string expectedToken);
+    bool credentialEpochCurrent(uint64_t epoch) const;
 
     mutable std::mutex mutex_;
     std::string token_; // SECRET: memory only, never logged
@@ -162,8 +176,10 @@ private:
     uint64_t restoreGen_ = 0;
     // Legacy plaintext tokens awaiting one-time migration. Validated only
     // when no stored session exists; otherwise discarded with a config
-    // sanitize. Never logged.
+    // sanitize. Never logged. Transient failures retry a bounded number
+    // of times before the candidate is discarded.
     std::vector<std::string> pendingLegacy_;
+    int migrationRetries_ = 0;
 
     // True once the user opened the LIVE-access application page this
     // session without access being granted since. Drives the pending

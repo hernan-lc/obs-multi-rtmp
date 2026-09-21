@@ -498,6 +498,12 @@ bool obs_module_load()
     return true;
 }
 
+void obs_module_unload()
+{
+    // Join every TikTok worker thread before the module unmaps.
+    TikTokAuthManager::instance().shutdown();
+}
+
 const char *obs_module_description(void)
 {
     return "Multiple RTMP Output Plugin";

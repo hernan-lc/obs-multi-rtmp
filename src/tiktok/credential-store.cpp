@@ -45,18 +45,6 @@ std::wstring Widen(const std::string &text)
     return out;
 }
 
-std::string Narrow(const wchar_t *text)
-{
-    if (!text || !*text)
-        return {};
-    const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    if (needed <= 1)
-        return {};
-    std::string out(static_cast<size_t>(needed - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
-    return out;
-}
-
 std::wstring TargetName()
 {
     return Widen(std::string(TikTokConstants::kCredentialService) + "/" +
@@ -209,114 +197,40 @@ std::unique_ptr<ICredentialStore> CreateSecureCredentialStore()
     return std::make_unique<KeychainCredentialStore>();
 }
 
-#else
+#else // Linux
 
-// Linux: Secret Service via libsecret, loaded with dlopen so the plugin
-// keeps working (memory-only) where libsecret is not installed. Only the
-// three password helpers plus error/password release are resolved.
+#if defined(TIKTOK_USE_LIBSECRET)
 
-#include <dlfcn.h>
+#include <libsecret/secret.h>
 
 namespace {
 
-// Minimal ABI-compatible subset of libsecret-1/GLib types.
-using gboolean = int;
-using gchar = char;
-using gint = int;
-using guint32 = unsigned int;
-using gpointer = void *;
-using GQuark = guint32;
-struct GError {
-    GQuark domain;
-    gint code;
-    gchar *message;
+const SecretSchema kTikTokSchema = {
+    TikTokConstants::kCredentialService,
+    SECRET_SCHEMA_NONE,
+    {
+        {"service", SECRET_SCHEMA_ATTRIBUTE_STRING},
+        {"account", SECRET_SCHEMA_ATTRIBUTE_STRING},
+        {nullptr, SECRET_SCHEMA_ATTRIBUTE_STRING},
+    },
 };
-struct GCancellable;
-enum SecretSchemaFlags { SECRET_SCHEMA_NONE = 0 };
-enum SecretSchemaAttributeType { SECRET_SCHEMA_ATTRIBUTE_STRING = 0 };
-struct SecretSchemaAttribute {
-    const gchar *name;
-    SecretSchemaAttributeType type;
-};
-struct SecretSchema {
-    const gchar *name;
-    SecretSchemaFlags flags;
-    SecretSchemaAttribute attributes[32];
-    gint reserved;
-    gpointer reserved2;
-    gpointer reserved3;
-    gpointer reserved4;
-    gpointer reserved5;
-    gpointer reserved6;
-    gpointer reserved7;
-};
-
-using SecretPasswordStoreSync = gboolean (*)(const SecretSchema *, const gchar *, const gchar *,
-                                             const gchar *, GCancellable *, GError **, ...);
-using SecretPasswordLookupSync = gchar *(*)(const SecretSchema *, GCancellable *, GError **, ...);
-using SecretPasswordClearSync = gboolean (*)(const SecretSchema *, GCancellable *, GError **, ...);
-using SecretPasswordFree = void (*)(gchar *);
-using GErrorFree = void (*)(GError *);
-
-constexpr char kCollectionDefault[] = "default";
-
-SecretSchema MakeSchema()
-{
-    SecretSchema schema{};
-    schema.name = TikTokConstants::kCredentialService;
-    schema.flags = SECRET_SCHEMA_NONE;
-    schema.attributes[0] = {"service", SECRET_SCHEMA_ATTRIBUTE_STRING};
-    schema.attributes[1] = {"account", SECRET_SCHEMA_ATTRIBUTE_STRING};
-    return schema;
-}
 
 class LibsecretCredentialStore : public ICredentialStore {
 public:
-    LibsecretCredentialStore()
-    {
-        handle_ = dlopen("libsecret-1.so.0", RTLD_NOW | RTLD_LOCAL);
-        if (!handle_)
-            handle_ = dlopen("libsecret-1.so", RTLD_NOW | RTLD_LOCAL);
-        if (handle_) {
-            store_ = reinterpret_cast<SecretPasswordStoreSync>(dlsym(handle_, "secret_password_store_sync"));
-            lookup_ =
-                reinterpret_cast<SecretPasswordLookupSync>(dlsym(handle_, "secret_password_lookup_sync"));
-            clear_ =
-                reinterpret_cast<SecretPasswordClearSync>(dlsym(handle_, "secret_password_clear_sync"));
-            passFree_ = reinterpret_cast<SecretPasswordFree>(dlsym(handle_, "secret_password_free"));
-            errorFree_ = reinterpret_cast<GErrorFree>(dlsym(handle_, "g_error_free"));
-            if (!store_ || !lookup_ || !clear_ || !passFree_ || !errorFree_) {
-                dlclose(handle_);
-                handle_ = nullptr;
-            }
-        }
-        schema_ = MakeSchema();
-    }
-
-    ~LibsecretCredentialStore() override
-    {
-        if (handle_)
-            dlclose(handle_);
-    }
-
-    bool available() const { return handle_ != nullptr; }
-
     std::optional<std::string> load() override
     {
-        if (!handle_)
-            return std::nullopt;
         GError *error = nullptr;
-        gchar *password = lookup_(&schema_, nullptr, &error, "service",
-                                  TikTokConstants::kCredentialService, "account",
-                                  TikTokConstants::kCredentialAccount, nullptr);
-        if (error) {
-            errorFree_(error);
+        gchar *password = secret_password_lookup_sync(
+            &kTikTokSchema, nullptr, &error, "service", TikTokConstants::kCredentialService,
+            "account", TikTokConstants::kCredentialAccount, nullptr);
+        if (error != nullptr) {
+            g_error_free(error);
             error = nullptr;
         }
-        if (!password)
+        if (password == nullptr)
             return std::nullopt;
         std::string token(password);
-        passFree_(password);
+        secret_password_free(password);
         if (token.empty())
             return std::nullopt;
         return token;
@@ -324,54 +238,45 @@ public:
 
     bool save(const std::string &token) override
     {
-        if (!handle_ || token.empty())
+        if (token.empty())
             return false;
         GError *error = nullptr;
-        const gboolean ok =
-            store_(&schema_, kCollectionDefault, "OBS Multi-RTMP TikTok OAuth token", token.c_str(),
-                   nullptr, &error, "service", TikTokConstants::kCredentialService, "account",
-                   TikTokConstants::kCredentialAccount, nullptr);
-        if (error) {
-            errorFree_(error);
-        }
+        const gboolean ok = secret_password_store_sync(
+            &kTikTokSchema, SECRET_COLLECTION_DEFAULT, "OBS Multi-RTMP TikTok OAuth token",
+            token.c_str(), nullptr, &error, "service", TikTokConstants::kCredentialService,
+            "account", TikTokConstants::kCredentialAccount, nullptr);
+        if (error != nullptr)
+            g_error_free(error);
         return ok != 0;
     }
 
     void remove() override
     {
-        if (!handle_)
-            return;
         GError *error = nullptr;
-        clear_(&schema_, nullptr, &error, "service", TikTokConstants::kCredentialService, "account",
-               TikTokConstants::kCredentialAccount, nullptr);
-        if (error) {
-            errorFree_(error);
-        }
+        secret_password_clear_sync(&kTikTokSchema, nullptr, &error, "service",
+                                   TikTokConstants::kCredentialService, "account",
+                                   TikTokConstants::kCredentialAccount, nullptr);
+        if (error != nullptr)
+            g_error_free(error);
     }
-
-private:
-    void *handle_ = nullptr;
-    SecretPasswordStoreSync store_ = nullptr;
-    SecretPasswordLookupSync lookup_ = nullptr;
-    SecretPasswordClearSync clear_ = nullptr;
-    SecretPasswordFree passFree_ = nullptr;
-    GErrorFree errorFree_ = nullptr;
-    SecretSchema schema_{};
 };
 
 } // namespace
 
 std::unique_ptr<ICredentialStore> CreateSecureCredentialStore()
 {
-    auto store = std::make_unique<LibsecretCredentialStore>();
-    if (!store->available())
-        return nullptr;
-    // Probe the daemon without touching the real entry: a load attempt
-    // fails closed (nullopt) when the Secret Service is unreachable, but
-    // that is indistinguishable from "no credential". Availability is
-    // decided lazily at save time instead; returning the store here is
-    // safe because every method fails closed.
-    return store;
+    // Every method fails closed when the Secret Service is unreachable.
+    return std::make_unique<LibsecretCredentialStore>();
 }
+
+#else // !TIKTOK_USE_LIBSECRET
+
+std::unique_ptr<ICredentialStore> CreateSecureCredentialStore()
+{
+    // Built without libsecret development files: memory-only fallback.
+    return nullptr;
+}
+
+#endif // TIKTOK_USE_LIBSECRET
 
 #endif

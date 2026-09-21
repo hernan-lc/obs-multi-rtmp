@@ -66,6 +66,14 @@ size_t WriteResponse(char *ptr, size_t size, size_t nmemb, void *userdata)
     return total;
 }
 
+thread_local const std::atomic<bool> *t_tiktokCancelFlag = nullptr;
+
+int CancelProgressCallback(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+{
+    const std::atomic<bool> *flag = t_tiktokCancelFlag;
+    return (flag != nullptr && flag->load(std::memory_order_relaxed)) ? 1 : 0;
+}
+
 void ApplyCommonOptions(CURL *curl, ResponseBuffer *response)
 {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, TikTokConstants::kStreamlabsUserAgent);
@@ -75,6 +83,11 @@ void ApplyCommonOptions(CURL *curl, ResponseBuffer *response)
     // TLS certificate verification stays at the libcurl default (enabled).
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteResponse);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+    // Progress callback exists only to honor TikTokNetworkCancel; it
+    // performs no I/O and never touches credentials.
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CancelProgressCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
 }
 
 CurlHeaders MakeAuthHeaders(const std::string &token)
@@ -83,6 +96,33 @@ CurlHeaders MakeAuthHeaders(const std::string &token)
     const std::string auth = "Authorization: Bearer " + token;
     headers = curl_slist_append(headers, auth.c_str());
     return CurlHeaders(headers);
+}
+
+// Maps transport-level curl failures. Returns true when the transfer
+// failed (fills failure/error); CURLE_OK falls through to HTTP parsing.
+bool MapCurlError(CURLcode code, const ResponseBuffer &response, TikTokFailure *failure,
+                  std::string *error)
+{
+    if (code == CURLE_OK)
+        return false;
+    if (code == CURLE_ABORTED_BY_CALLBACK) {
+        *failure = TikTokFailure::Cancelled;
+        *error = "Request to Streamlabs was cancelled.";
+        return true;
+    }
+    if (code == CURLE_WRITE_ERROR && response.overflow) {
+        *failure = TikTokFailure::InvalidResponse;
+        *error = "Streamlabs response exceeded the size limit.";
+        return true;
+    }
+    if (code == CURLE_OPERATION_TIMEDOUT) {
+        *failure = TikTokFailure::Timeout;
+        *error = "Request to Streamlabs timed out.";
+        return true;
+    }
+    *failure = TikTokFailure::Network;
+    *error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+    return true;
 }
 
 TikTokFailure ClassifyHttpStatus(long httpCode)
@@ -204,6 +244,17 @@ bool IsBlank(const std::string &text)
 }
 
 } // namespace
+
+TikTokNetworkCancel::TikTokNetworkCancel(const std::atomic<bool> *flag)
+    : previous_(t_tiktokCancelFlag)
+{
+    t_tiktokCancelFlag = flag;
+}
+
+TikTokNetworkCancel::~TikTokNetworkCancel()
+{
+    t_tiktokCancelFlag = previous_;
+}
 
 std::string StreamlabsTikTokAPI::TruncateToChars(const std::string &text, size_t maxChars)
 {
@@ -550,19 +601,11 @@ TikTokCategoryResult StreamlabsTikTokAPI::ResolveCategory(const std::string &tok
     ApplyCommonOptions(curl.get(), &response);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    if (code == CURLE_WRITE_ERROR && response.overflow) {
-        result.failure = TikTokFailure::InvalidResponse;
-        result.error = "Streamlabs response exceeded the size limit.";
-        return result;
-    }
-    if (code == CURLE_OPERATION_TIMEDOUT) {
-        result.failure = TikTokFailure::Timeout;
-        result.error = "Request to Streamlabs timed out.";
-        return result;
-    }
-    if (code != CURLE_OK) {
-        result.failure = TikTokFailure::Network;
-        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+    TikTokFailure transportFailure = TikTokFailure::None;
+    std::string transportError;
+    if (MapCurlError(code, response, &transportFailure, &transportError)) {
+        result.failure = transportFailure;
+        result.error = transportError;
         return result;
     }
 
@@ -619,19 +662,11 @@ TikTokStartResult StreamlabsTikTokAPI::StartStream(const std::string &token, con
     ApplyCommonOptions(curl.get(), &response);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    if (code == CURLE_WRITE_ERROR && response.overflow) {
-        result.failure = TikTokFailure::InvalidResponse;
-        result.error = "Streamlabs response exceeded the size limit.";
-        return result;
-    }
-    if (code == CURLE_OPERATION_TIMEDOUT) {
-        result.failure = TikTokFailure::Timeout;
-        result.error = "Request to Streamlabs timed out.";
-        return result;
-    }
-    if (code != CURLE_OK) {
-        result.failure = TikTokFailure::Network;
-        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+    TikTokFailure transportFailure = TikTokFailure::None;
+    std::string transportError;
+    if (MapCurlError(code, response, &transportFailure, &transportError)) {
+        result.failure = transportFailure;
+        result.error = transportError;
         return result;
     }
 
@@ -676,19 +711,11 @@ bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string 
     ApplyCommonOptions(curl.get(), &response);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    if (code == CURLE_WRITE_ERROR && response.overflow) {
+    TikTokFailure transportFailure = TikTokFailure::None;
+    std::string transportError;
+    if (MapCurlError(code, response, &transportFailure, &transportError)) {
         if (error)
-            *error = "Streamlabs response exceeded the size limit.";
-        return false;
-    }
-    if (code == CURLE_OPERATION_TIMEDOUT) {
-        if (error)
-            *error = "Request to Streamlabs timed out.";
-        return false;
-    }
-    if (code != CURLE_OK) {
-        if (error)
-            *error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+            *error = transportError;
         return false;
     }
 
@@ -722,19 +749,11 @@ TikTokAccountResult StreamlabsTikTokAPI::GetAccountInfo(const std::string &token
     ApplyCommonOptions(curl.get(), &response);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    if (code == CURLE_WRITE_ERROR && response.overflow) {
-        result.failure = TikTokFailure::InvalidResponse;
-        result.error = "Streamlabs response exceeded the size limit.";
-        return result;
-    }
-    if (code == CURLE_OPERATION_TIMEDOUT) {
-        result.failure = TikTokFailure::Timeout;
-        result.error = "Request to Streamlabs timed out.";
-        return result;
-    }
-    if (code != CURLE_OK) {
-        result.failure = TikTokFailure::Network;
-        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+    TikTokFailure transportFailure = TikTokFailure::None;
+    std::string transportError;
+    if (MapCurlError(code, response, &transportFailure, &transportError)) {
+        result.failure = transportFailure;
+        result.error = transportError;
         return result;
     }
 
@@ -780,19 +799,11 @@ TikTokCategoryListResult StreamlabsTikTokAPI::ListCategories(const std::string &
     ApplyCommonOptions(curl.get(), &response);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    if (code == CURLE_WRITE_ERROR && response.overflow) {
-        result.failure = TikTokFailure::InvalidResponse;
-        result.error = "Streamlabs response exceeded the size limit.";
-        return result;
-    }
-    if (code == CURLE_OPERATION_TIMEDOUT) {
-        result.failure = TikTokFailure::Timeout;
-        result.error = "Request to Streamlabs timed out.";
-        return result;
-    }
-    if (code != CURLE_OK) {
-        result.failure = TikTokFailure::Network;
-        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+    TikTokFailure transportFailure = TikTokFailure::None;
+    std::string transportError;
+    if (MapCurlError(code, response, &transportFailure, &transportError)) {
+        result.failure = transportFailure;
+        result.error = transportError;
         return result;
     }
 
