@@ -3,10 +3,12 @@
 #include <regex>
 #include <optional>
 #include <tuple>
+#include <mutex>
 #include "push-widget.h"
 #include "edit-widget.h"
 #include "output-config.h"
 #include "protocols.h"
+#include "streamlabs-tiktok.h"
 
 #include "obs.hpp"
 
@@ -118,6 +120,13 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     bool using_main_audio_encoder_ = false;
     obs_view_t* scene_view_ = 0;
     bool isUseDelay_ = false;
+
+    // TikTok LIVE session state. Guarded because cleanup runs both on the UI
+    // thread (stop/shutdown paths) and on output signal threads (OnStopped).
+    std::mutex tiktokMutex_;
+    std::string tiktokStreamId_;
+    std::string tiktokToken_;
+    bool tiktokLiveCreated_ = false;
 
     QPushButton* GetDeleteButton() {
         return remove_btn_;
@@ -247,6 +256,138 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         return true;
     }
 
+
+    const char *TikTokFailureText(TikTokFailure failure, bool resolvingCategory)
+    {
+        switch (failure) {
+        case TikTokFailure::Auth:
+        case TikTokFailure::Forbidden:
+            return obs_module_text("Error.TikTokAuth");
+        case TikTokFailure::RateLimited:
+            return obs_module_text("Error.TikTokRateLimit");
+        case TikTokFailure::Network:
+        case TikTokFailure::Timeout:
+            return obs_module_text("Error.TikTokNetwork");
+        case TikTokFailure::None:
+        case TikTokFailure::BadRequest:
+        case TikTokFailure::NotFound:
+        case TikTokFailure::Server:
+        case TikTokFailure::InvalidResponse:
+        default:
+            return resolvingCategory ? obs_module_text("Error.TikTokCategory")
+                                     : obs_module_text("Error.TikTokCreateLive");
+        }
+    }
+
+    void ShowTikTokError(const char *prefix, const std::string &detail)
+    {
+        QString msg = QString::fromUtf8(prefix);
+        // Detail comes from the API client and never contains credentials.
+        if (!detail.empty())
+            msg += "\n" + QString::fromUtf8(detail.c_str());
+        SetMsg(msg);
+    }
+
+    bool ApplyTikTokServiceSettings(const std::string &server, const std::string &key)
+    {
+        if (!output_)
+            return false;
+        OBSServiceAutoRelease service = obs_output_get_service(output_);
+        if (!service)
+            return false;
+        OBSDataAutoRelease settings = obs_service_get_settings(service);
+        if (!settings)
+            return false;
+        obs_data_set_string(settings, "server", server.c_str());
+        obs_data_set_string(settings, "key", key.c_str());
+        obs_service_update(service, settings);
+        return true;
+    }
+
+    // Creates the TikTok LIVE session (when enabled) and points the live
+    // output service at the generated credentials. Must run after all local
+    // OBS preparation so a local failure never leaves an orphaned LIVE.
+    // NOTE: the Streamlabs requests are synchronous with short timeouts;
+    // converting them to a worker thread is a follow-up (async P2 item).
+    bool PrepareTikTokLive()
+    {
+        if (!config_->tiktok.enabled)
+            return true;
+
+        if (config_->protocol != "RTMP") {
+            SetMsg(obs_module_text("Error.TikTokRequiresRTMP"));
+            return false;
+        }
+
+        if (config_->tiktok.token.empty()) {
+            SetMsg(obs_module_text("Error.TikTokTokenMissing"));
+            return false;
+        }
+
+        auto category = StreamlabsTikTokAPI::ResolveCategory(config_->tiktok.token, config_->tiktok.category);
+        if (!category.success) {
+            blog(LOG_WARNING, TAG "TikTok category lookup failed for '%s'.", config_->name.c_str());
+            ShowTikTokError(TikTokFailureText(category.failure, true), category.error);
+            return false;
+        }
+        if (!config_->tiktok.category.empty() && !category.matchedExact)
+            blog(LOG_INFO, TAG "TikTok category '%s' not found, streaming under Other.",
+                 config_->tiktok.category.c_str());
+
+        auto started = StreamlabsTikTokAPI::StartStream(config_->tiktok.token, config_->tiktok.title,
+                                                        category.categoryId, config_->tiktok.matureContent);
+        if (!started.success) {
+            blog(LOG_WARNING, TAG "TikTok LIVE creation failed for '%s'.", config_->name.c_str());
+            ShowTikTokError(TikTokFailureText(started.failure, false), started.error);
+            return false;
+        }
+
+        // Generated credentials are session-only: they update the live
+        // service, never the saved config.
+        if (!ApplyTikTokServiceSettings(started.server, started.key)) {
+            std::string endError;
+            StreamlabsTikTokAPI::EndStream(config_->tiktok.token, started.streamId, &endError);
+            if (!endError.empty())
+                blog(LOG_WARNING, TAG "TikTok LIVE cleanup after setup failure: %s", endError.c_str());
+            SetMsg(obs_module_text("Error.CreateRtmpService"));
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tiktokMutex_);
+            tiktokLiveCreated_ = true;
+            tiktokStreamId_ = started.streamId;
+            tiktokToken_ = config_->tiktok.token;
+        }
+        blog(LOG_INFO, TAG "TikTok LIVE session created for '%s'.", config_->name.c_str());
+        return true;
+    }
+
+    // Ends the TikTok LIVE session if one is active. Idempotent and safe to
+    // call from every stop path (UI thread or output signal threads).
+    void CleanupTikTokLive()
+    {
+        std::string token, streamId;
+        {
+            std::lock_guard<std::mutex> lock(tiktokMutex_);
+            if (!tiktokLiveCreated_)
+                return;
+            tiktokLiveCreated_ = false;
+            token = std::move(tiktokToken_);
+            streamId = std::move(tiktokStreamId_);
+            tiktokToken_.clear();
+            tiktokStreamId_.clear();
+        }
+        // State is cleared before the request so concurrent stop paths can
+        // never double-end (or double-log) the same session.
+        if (!token.empty() && !streamId.empty()) {
+            std::string error;
+            if (!StreamlabsTikTokAPI::EndStream(token, streamId, &error))
+                blog(LOG_WARNING, TAG "Failed to end TikTok LIVE session: %s", error.c_str());
+            else
+                blog(LOG_INFO, TAG "TikTok LIVE session ended.");
+        }
+    }
 
     std::string VideoEncoderName() {
         return "multi-rtmp-venc" + config_->videoConfig.value_or("");
@@ -451,6 +592,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 
     bool ReleaseOutput()
     {
+        CleanupTikTokLive();
+
         if (output_) {
             DisconnectSignals(output_);
         }
@@ -649,15 +792,23 @@ public:
             return;
         }
 
+        if (!PrepareTikTokLive())
+        {
+            return;
+        }
+
         if (!obs_output_start(output_))
         {
+            CleanupTikTokLive();
             SetMsg(obs_module_text("Error.StartOutput"));
         }
     }
 
     void StopStreaming() override {
-        if (!IsRunning())
+        if (!IsRunning()) {
+            CleanupTikTokLive();
             return;
+        }
         
         bool useForce = false;
         if (isUseDelay_) {
@@ -675,6 +826,9 @@ public:
             obs_output_stop(output_);
         else
             obs_output_force_stop(output_);
+
+        // No TikTok cleanup here: OnStopped() ends the session once the
+        // output has actually stopped (see CleanupTikTokLive).
     }
    
     void OnOBSEvent(obs_frontend_event ev) override
@@ -730,6 +884,7 @@ public:
         {
             obs_output_force_stop(output_);
         }
+        CleanupTikTokLive();
     }
 
     bool ShowEditDlg() override
@@ -851,6 +1006,12 @@ public:
 
         ReleaseOutputEncoder();
         ReleaseOutputSceneView();
+
+        // Ends the TikTok session once the output has actually stopped, so a
+        // graceful (possibly delayed) stop keeps receiving until the end.
+        // This also covers fatal output failures; user/shutdown stop paths
+        // call CleanupTikTokLive() directly as well (it is idempotent).
+        CleanupTikTokLive();
     }
 };
 
