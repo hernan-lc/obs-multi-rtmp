@@ -365,13 +365,14 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 
     // Ends the TikTok LIVE session if one is active. Idempotent and safe to
     // call from every stop path (UI thread or output signal threads).
-    void CleanupTikTokLive()
+    // Returns false when a session was active but ending it failed.
+    bool CleanupTikTokLive()
     {
         std::string token, streamId;
         {
             std::lock_guard<std::mutex> lock(tiktokMutex_);
             if (!tiktokLiveCreated_)
-                return;
+                return true;
             tiktokLiveCreated_ = false;
             token = std::move(tiktokToken_);
             streamId = std::move(tiktokStreamId_);
@@ -382,11 +383,13 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         // never double-end (or double-log) the same session.
         if (!token.empty() && !streamId.empty()) {
             std::string error;
-            if (!StreamlabsTikTokAPI::EndStream(token, streamId, &error))
+            if (!StreamlabsTikTokAPI::EndStream(token, streamId, &error)) {
                 blog(LOG_WARNING, TAG "Failed to end TikTok LIVE session: %s", error.c_str());
-            else
-                blog(LOG_INFO, TAG "TikTok LIVE session ended.");
+                return false;
+            }
+            blog(LOG_INFO, TAG "TikTok LIVE session ended.");
         }
+        return true;
     }
 
     std::string VideoEncoderName() {
@@ -972,7 +975,13 @@ public:
 
     void OnStopped(int code) override
     {
-        GetGlobalService().RunInUIThread([this, code]() {
+        // Ends the TikTok session once the output has actually stopped, so a
+        // graceful (possibly delayed) stop keeps receiving until the end.
+        // This also covers fatal output failures; user/shutdown stop paths
+        // call CleanupTikTokLive() directly as well (it is idempotent).
+        const bool tiktokEnded = CleanupTikTokLive();
+
+        GetGlobalService().RunInUIThread([this, code, tiktokEnded]() {
             ResetInfo();
             timer_->stop();
 
@@ -984,7 +993,10 @@ public:
             switch(code)
             {
                 case 0:
-                    SetMsg(u8"");
+                    if (!tiktokEnded)
+                        SetMsg(obs_module_text("Error.TikTokEndLive"));
+                    else
+                        SetMsg(u8"");
                     break;
                 case -1:
                     SetMsg(obs_module_text("Error.WrongRTMPUrl"));
@@ -1006,12 +1018,6 @@ public:
 
         ReleaseOutputEncoder();
         ReleaseOutputSceneView();
-
-        // Ends the TikTok session once the output has actually stopped, so a
-        // graceful (possibly delayed) stop keeps receiving until the end.
-        // This also covers fatal output failures; user/shutdown stop paths
-        // call CleanupTikTokLive() directly as well (it is idempotent).
-        CleanupTikTokLive();
     }
 };
 
