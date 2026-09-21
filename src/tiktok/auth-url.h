@@ -51,6 +51,12 @@ std::optional<QString> ExtractAuthorizationCode(const QUrl &url);
 // the expected Streamlabs success document.
 QString SuccessPageId(const QUrl &url);
 
+// True for TikTok's official LIVE-access application result page.
+// Used only to notice, in our own embedded browser, that the user
+// reached the result step (drives the pending state + auto-close).
+// No page content is ever read.
+bool IsLiveAccessResultUrl(const QUrl &url);
+
 // Secret-free log form of any auth URL: host + path, no query.
 QString LogSafeUrl(const QUrl &url);
 QString LogSafeUrl(const QString &urlText);

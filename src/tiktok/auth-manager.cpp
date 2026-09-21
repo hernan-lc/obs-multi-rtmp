@@ -2,6 +2,7 @@
 
 #include "pch.h"
 
+#include <QDesktopServices>
 #include <QJsonDocument>
 #include <QMessageBox>
 #include <QPointer>
@@ -29,6 +30,8 @@ constexpr int kPollIntervalMs = 250;
 constexpr int kExchangeTimeoutMs = 30000;
 constexpr int kOverallTimeoutMs = 10 * 60 * 1000;
 constexpr int kTikTokRecheckDelayMs = 1500;
+constexpr int kAccessRefreshMs = 15 * 60 * 1000;
+constexpr int kMinRefreshGapSec = 60;
 
 std::atomic<int> g_liveActivity{0};
 
@@ -73,6 +76,13 @@ bool TikTokAuthManager::isAuthenticated() const
     return status_ == Status::Authenticated;
 }
 
+bool TikTokAuthManager::isLiveAccessGranted() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_ == Status::Authenticated && account_.has_value() &&
+           account_->liveEligibilityKnown && account_->canGoLive;
+}
+
 std::optional<TikTokAccountInfo> TikTokAuthManager::account() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -111,9 +121,20 @@ QString TikTokAuthManager::statusText() const
         else
             name += QString::fromUtf8("tiktok");
         QString text = QString::fromUtf8(obs_module_text("TikTok.Connected")).arg(name);
-        if (account_.has_value() && account_->liveEligibilityKnown && !account_->canGoLive) {
-            text += QStringLiteral("\n") +
-                    QString::fromUtf8(obs_module_text("TikTok.LiveUnavailable"));
+        const bool granted = account_.has_value() && account_->liveEligibilityKnown &&
+                             account_->canGoLive;
+        if (!granted && account_.has_value()) {
+            if (!account_->applicationStatus.empty()) {
+                text += QStringLiteral("\n") +
+                        QString::fromUtf8(obs_module_text("TikTok.ApplicationStatus"))
+                            .arg(QString::fromUtf8(account_->applicationStatus.c_str()));
+            } else if (applyOpened_) {
+                text += QStringLiteral("\n") +
+                        QString::fromUtf8(obs_module_text("TikTok.ApplicationPending"));
+            } else if (account_->liveEligibilityKnown && !account_->canGoLive) {
+                text += QStringLiteral("\n") +
+                        QString::fromUtf8(obs_module_text("TikTok.LiveUnavailable"));
+            }
         }
         return text;
     }
@@ -213,6 +234,7 @@ void TikTokAuthManager::restoreSession()
                     blog(LOG_INFO, TAG "TikTok: session restored");
                     setStatus(Status::Authenticated);
                     emit loginSucceeded();
+                    scheduleAccessRefresh();
                     return;
                 }
                 if (validation.failure == TikTokFailure::Auth ||
@@ -305,6 +327,7 @@ void TikTokAuthManager::pumpLegacyMigration()
                     SaveMultiOutputConfig();
                     setStatus(Status::Authenticated);
                     emit loginSucceeded();
+                    scheduleAccessRefresh();
                     if (!secureStoragePersistent()) {
                         QMessageBox::warning(
                             nullptr, QString::fromUtf8(obs_module_text("TikTok.Settings")),
@@ -397,6 +420,59 @@ void TikTokAuthManager::cancelLogin()
     finishLoginAttempt(attempt, QString::fromUtf8(obs_module_text("TikTok.LoginCancelled")));
 }
 
+void TikTokAuthManager::openLiveAccessApplication(QWidget *parent)
+{
+    if (applyDialog_) {
+        applyDialog_->raise();
+        return;
+    }
+    if (!webEngineAvailable()) {
+        // Help link only (not a credential flow), so the external
+        // browser is an acceptable fallback here.
+        QDesktopServices::openUrl(QUrl(QString::fromLatin1(TikTokConstants::kLiveAccessApplyUrl)));
+        return;
+    }
+    blog(LOG_INFO, TAG "TikTok: opening LIVE-access application page");
+    applyDialog_ = new TikTokAuthDialog(
+        parent, QString::fromUtf8(obs_module_text("TikTok.ApplyAccess")));
+    QObject::connect(applyDialog_, &QObject::destroyed, this, [this]() { onApplyClosed(); });
+    // Navigation is observed only to notice the result step (pending +
+    // auto-close). No page content is read and no auth flow is attached:
+    // the window stays user-driven.
+    QObject::connect(applyDialog_, &TikTokAuthDialog::urlObserved, this,
+                     [this](const QUrl &url) { onApplyUrl(url); });
+    applyDialog_->setAttribute(Qt::WA_DeleteOnClose);
+    applyDialog_->navigate(QUrl(QString::fromLatin1(TikTokConstants::kLiveAccessApplyUrl)));
+    applyDialog_->show();
+}
+
+void TikTokAuthManager::onApplyUrl(const QUrl &url)
+{
+    if (!applyDialog_ || !TikTokAuthUrl::IsLiveAccessResultUrl(url))
+        return;
+    blog(LOG_INFO, TAG "TikTok: LIVE-access result page reached, marking pending");
+    // Closing destroys the window (WA_DeleteOnClose), which lands in
+    // onApplyClosed() for the pending state + follow-up refresh.
+    applyDialog_->close();
+}
+
+void TikTokAuthManager::onApplyClosed()
+{
+    applyDialog_ = nullptr;
+    const bool authenticated = isAuthenticated();
+    const bool granted = isLiveAccessGranted();
+    if (authenticated && !granted) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            applyOpened_ = true;
+        }
+        emit authenticationChanged();
+        // One cheap check; catches fast approvals without waiting for
+        // the periodic refresh.
+        refreshAccessState();
+    }
+}
+
 void TikTokAuthManager::logout(QWidget *parent)
 {
     if (TikTokLiveRegistry::hasActiveActivity()) {
@@ -411,6 +487,13 @@ void TikTokAuthManager::logout(QWidget *parent)
     // cookies cannot be re-persisted on destruction.
     scrubDialogSession();
     teardownDialog();
+    if (refreshTimer_)
+        refreshTimer_->stop();
+    if (applyDialog_) {
+        // Its TikTok session is being cleared; close it so it cannot
+        // linger on a half-logged-out page.
+        applyDialog_->close();
+    }
     flow_.reset();
     if (secureStore_)
         secureStore_->remove();
@@ -422,6 +505,7 @@ void TikTokAuthManager::logout(QWidget *parent)
         authEpoch_++;
         loginActive_ = false;
         reauthing_ = false;
+        applyOpened_ = false;
     }
     TikTokAuthDialog::clearPersistentData();
     blog(LOG_INFO, TAG "TikTok: logged out");
@@ -438,12 +522,129 @@ void TikTokAuthManager::handleAuthFailure(uint64_t epoch)
         token_.clear();
         account_.reset();
         authEpoch_++;
+        applyOpened_ = false;
     }
     if (secureStore_)
         secureStore_->remove();
     memoryStore_->remove();
+    if (refreshTimer_)
+        refreshTimer_->stop();
     blog(LOG_INFO, TAG "TikTok: session expired (credential rejected)");
     setStatus(Status::SessionExpired);
+}
+
+void TikTokAuthManager::noteLiveStartSucceeded(uint64_t epoch)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (epoch != authEpoch_ || token_.empty())
+            return;
+        if (!account_.has_value())
+            account_ = TikTokAccountInfo{};
+        account_->liveEligibilityKnown = true;
+        account_->canGoLive = true;
+        account_->liveUnavailableReason.clear();
+        applyOpened_ = false;
+    }
+    blog(LOG_INFO, TAG "TikTok: LIVE access confirmed by successful start");
+    emit authenticationChanged();
+}
+
+void TikTokAuthManager::noteLiveAccessDenied(uint64_t epoch)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (epoch != authEpoch_ || token_.empty())
+            return;
+        if (!account_.has_value())
+            account_ = TikTokAccountInfo{};
+        // Eligibility only: the credential stays valid and saved.
+        account_->liveEligibilityKnown = true;
+        account_->canGoLive = false;
+    }
+    blog(LOG_INFO, TAG "TikTok: LIVE access denied for this account (session kept)");
+    emit authenticationChanged();
+}
+
+void TikTokAuthManager::refreshAccessState()
+{
+    std::string token;
+    uint64_t epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (loginActive_ || restoring_ || refreshing_ || token_.empty())
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (lastRefresh_ != std::chrono::steady_clock::time_point{} &&
+            now - lastRefresh_ < std::chrono::seconds(kMinRefreshGapSec))
+            return;
+        refreshing_ = true;
+        token = token_;
+        epoch = authEpoch_;
+    }
+    std::thread([this, token = std::move(token), epoch]() {
+        StreamlabsTikTokClient probe(token);
+        TikTokAccountResult result = probe.GetAccountInfo();
+        QMetaObject::invokeMethod(
+            this,
+            [this, result = std::move(result), epoch]() mutable {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    refreshing_ = false;
+                    if (epoch != authEpoch_)
+                        return; // stale: a newer session exists
+                    lastRefresh_ = std::chrono::steady_clock::now();
+                }
+                if (result.success) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (account_.has_value() && !result.account.liveEligibilityKnown &&
+                            account_->liveEligibilityKnown) {
+                            // A refresh without eligibility fields must not
+                            // wipe a positively observed state.
+                            result.account.liveEligibilityKnown = true;
+                            result.account.canGoLive = account_->canGoLive;
+                            result.account.liveUnavailableReason =
+                                account_->liveUnavailableReason;
+                            if (result.account.applicationStatus.empty())
+                                result.account.applicationStatus =
+                                    account_->applicationStatus;
+                        }
+                        account_ = result.account;
+                        if (account_->liveEligibilityKnown && account_->canGoLive)
+                            applyOpened_ = false;
+                    }
+                    emit authenticationChanged();
+                    return;
+                }
+                if (result.failure == TikTokFailure::Auth)
+                    handleAuthFailure(epoch);
+                else if (result.failure == TikTokFailure::Forbidden)
+                    noteLiveAccessDenied(epoch);
+                // Transient failures: keep everything, the timer retries.
+            },
+            Qt::QueuedConnection);
+    }).detach();
+}
+
+void TikTokAuthManager::scheduleAccessRefresh()
+{
+    if (!refreshTimer_) {
+        refreshTimer_ = new QTimer(this);
+        refreshTimer_->setSingleShot(true);
+        QObject::connect(refreshTimer_, &QTimer::timeout, this, [this]() {
+            bool active = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                active = (status_ == Status::Authenticated);
+            }
+            if (!active)
+                return;
+            refreshAccessState();
+            scheduleAccessRefresh();
+        });
+    }
+    refreshTimer_->start(kAccessRefreshMs);
 }
 
 void TikTokAuthManager::onDialogUrl(uint64_t attempt, const QUrl &url)
@@ -664,6 +865,9 @@ void TikTokAuthManager::acceptValidatedLogin(uint64_t attempt, const std::string
         authEpoch_++;
         loginActive_ = false;
         reauthing_ = false;
+        // A new account may have signed in; pending memory belongs to
+        // the previous session.
+        applyOpened_ = false;
     }
     stopLoginTimers();
     teardownDialog();
@@ -671,6 +875,7 @@ void TikTokAuthManager::acceptValidatedLogin(uint64_t attempt, const std::string
     blog(LOG_INFO, TAG "TikTok: login succeeded");
     setStatus(Status::Authenticated);
     emit loginSucceeded();
+    scheduleAccessRefresh();
     if (!secureStoragePersistent()) {
         QMessageBox::warning(notifyParent, QString::fromUtf8(obs_module_text("TikTok.Settings")),
                              QString::fromUtf8(obs_module_text("TikTok.SecureStorageUnavailable")));

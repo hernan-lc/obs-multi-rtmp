@@ -309,12 +309,21 @@ static int TestAccountLiveEligibility()
     CHECK(r.account.liveEligibilityKnown);
     CHECK(!r.account.canGoLive);
     CHECK(r.account.liveUnavailableReason.find("followers") != std::string::npos);
+    CHECK(r.account.applicationStatus == "review");
 
     auto eligible =
         StreamlabsTikTokAPI::ParseAccountResponse(200, R"({"user":{"username":"u"},"can_be_live":true})");
     CHECK(eligible.success);
     CHECK(eligible.account.liveEligibilityKnown);
     CHECK(eligible.account.canGoLive);
+
+    // Application status without an eligibility verdict: surfaced for
+    // the pending display, eligibility stays unknown.
+    auto pending = StreamlabsTikTokAPI::ParseAccountResponse(
+        200, R"({"user":{"username":"u"},"application_status":"pending"})");
+    CHECK(pending.success);
+    CHECK(!pending.account.liveEligibilityKnown);
+    CHECK(pending.account.applicationStatus == "pending");
     return 0;
 }
 

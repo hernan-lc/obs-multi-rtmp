@@ -18,6 +18,13 @@ constexpr const char *kAuthDataUrl = "https://streamlabs.com/api/v5/slobs/auth/d
 // First page of the embedded login flow.
 constexpr const char *kTikTokLoginUrl = "https://www.tiktok.com/login";
 
+// Official TikTok LIVE PC-access application entry, as published in
+// Streamlabs' public guide. Opened for the user to drive themselves
+// (the plugin never submits applications); approval is TikTok's decision.
+constexpr const char *kLiveAccessApplyUrl =
+    "https://www.tiktok.com/falcon/live_g/live_access_pc_apply/intro/index.html"
+    "?id=GL6399433079641606942&lang=en-US";
+
 // Streamlabs login entry; the PKCE challenge is attached as query params.
 constexpr const char *kStreamlabsLoginUrl = "https://streamlabs.com/m/login";
 

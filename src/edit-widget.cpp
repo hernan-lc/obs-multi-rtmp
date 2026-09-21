@@ -253,6 +253,7 @@ class EditOutputWidgetImpl: public EditOutputWidget
     QLabel* tiktokAuthStatus_ = 0;
     QPushButton* tiktokLoginButton_ = 0;
     QPushButton* tiktokLogoutButton_ = 0;
+    QPushButton* tiktokApplyButton_ = 0;
     QLineEdit* tiktokTitle_ = 0;
     QComboBox* tiktokCategory_ = 0;
     QComboBox* tiktokAudience_ = 0;
@@ -661,15 +662,22 @@ public:
                     auto gp = new QGroupBox(obs_module_text("TikTok.Settings"), container_);
                     sub_grid->addWidget(gp, 2, 0, 1, 2);
                     auto tiktokLayout = new QGridLayout();
+                    tiktokLayout->setColumnStretch(1, 1);
                     tiktokLayout->addWidget(tiktokEnable_ = new QCheckBox(obs_module_text("TikTok.Enable"), gp),
-                                            0, 0, 1, 2);
+                                            0, 0, 1, 3);
                     tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Status"), gp), 1, 0);
                     tiktokLayout->addWidget(tiktokAuthStatus_ = new QLabel(gp), 1, 1);
                     tiktokAuthStatus_->setWordWrap(true);
                     tiktokLayout->addWidget(
+                        tiktokApplyButton_ = new QPushButton(obs_module_text("TikTok.ApplyAccess"), gp),
+                        1, 2);
+                    QObject::connect(tiktokApplyButton_, &QPushButton::clicked, [this]() {
+                        TikTokAuthManager::instance().openLiveAccessApplication(this);
+                    });
+                    tiktokLayout->addWidget(
                         tiktokLoginButton_ = new QPushButton(obs_module_text("TikTok.Login"), gp), 2, 0);
                     tiktokLayout->addWidget(
-                        tiktokLogoutButton_ = new QPushButton(obs_module_text("TikTok.Logout"), gp), 2, 1);
+                        tiktokLogoutButton_ = new QPushButton(obs_module_text("TikTok.Logout"), gp), 2, 1, 1, 2);
                     QObject::connect(tiktokLoginButton_, &QPushButton::clicked, [this]() {
                         TikTokAuthManager::instance().login(this);
                     });
@@ -677,9 +685,9 @@ public:
                         TikTokAuthManager::instance().logout(this);
                     });
                     tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Title"), gp), 3, 0);
-                    tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", gp), 3, 1);
+                    tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", gp), 3, 1, 1, 2);
                     tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Category"), gp), 4, 0);
-                    tiktokLayout->addWidget(tiktokCategory_ = new QComboBox(gp), 4, 1);
+                    tiktokLayout->addWidget(tiktokCategory_ = new QComboBox(gp), 4, 1, 1, 2);
                     tiktokCategory_->setEditable(true);
                     tiktokCategory_->setInsertPolicy(QComboBox::NoInsert);
                     tiktokCategoryDebounce_ = new QTimer(this);
@@ -691,7 +699,7 @@ public:
                         RunTikTokCategorySearch();
                     });
                     tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Audience"), gp), 5, 0);
-                    tiktokLayout->addWidget(tiktokAudience_ = new QComboBox(gp), 5, 1);
+                    tiktokLayout->addWidget(tiktokAudience_ = new QComboBox(gp), 5, 1, 1, 2);
                     tiktokAudience_->addItem(obs_module_text("TikTok.AudienceEveryone"), "0");
                     tiktokAudience_->addItem(obs_module_text("TikTok.AudienceAdult"), "1");
                     gp->setLayout(tiktokLayout);
@@ -710,6 +718,9 @@ public:
                                                                message);
                                      });
                     UpdateTikTokAuth();
+                    // One guarded check so the status is fresh when the
+                    // user looks at it (e.g. after an approval landed).
+                    TikTokAuthManager::instance().refreshAccessState();
                 }
             }
             layout->addLayout(sub_grid, 1);
@@ -1089,7 +1100,7 @@ public:
 
     void UpdateTikTokAuth()
     {
-        if (!tiktokAuthStatus_ || !tiktokLoginButton_ || !tiktokLogoutButton_)
+        if (!tiktokAuthStatus_ || !tiktokLoginButton_ || !tiktokLogoutButton_ || !tiktokApplyButton_)
             return;
         auto &auth = TikTokAuthManager::instance();
         tiktokAuthStatus_->setText(auth.statusText());
@@ -1101,6 +1112,10 @@ public:
         tiktokLogoutButton_->setVisible(authenticated);
         tiktokLoginButton_->setEnabled(!busy);
         tiktokLogoutButton_->setEnabled(!busy);
+        // The application page needs a TikTok login and is pointless
+        // once access is granted: authenticated but not granted only.
+        tiktokApplyButton_->setVisible(authenticated && !auth.isLiveAccessGranted());
+        tiktokApplyButton_->setEnabled(!busy);
     }
 
     void RunTikTokCategorySearch()
@@ -1123,9 +1138,10 @@ public:
                     if (gen != tiktokCategoryGen_ || !tiktokCategory_)
                         return;
                     if (!result.success) {
-                        if (result.failure == TikTokFailure::Auth ||
-                            result.failure == TikTokFailure::Forbidden)
+                        if (result.failure == TikTokFailure::Auth)
                             TikTokAuthManager::instance().handleAuthFailure(epoch);
+                        else if (result.failure == TikTokFailure::Forbidden)
+                            TikTokAuthManager::instance().noteLiveAccessDenied(epoch);
                         return;
                     }
                     const QString current = tiktokCategory_->currentText();

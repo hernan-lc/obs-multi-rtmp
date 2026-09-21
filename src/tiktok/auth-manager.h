@@ -17,6 +17,7 @@
 #include <QObject>
 #include <QString>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,11 @@ public:
     static TikTokAuthManager &instance();
 
     bool isAuthenticated() const;
+    // True when LIVE access is positively known: the API reported
+    // eligibility or a LIVE was started with this session. Auth and
+    // eligibility stay separate: authenticated but unknown/unavailable
+    // is not granted.
+    bool isLiveAccessGranted() const;
     std::optional<TikTokAccountInfo> account() const;
     std::optional<TikTokUserProfile> profile() const;
     Status status() const;
@@ -86,10 +92,28 @@ public:
     void cancelLogin();
     void logout(QWidget *parent = nullptr);
 
-    // Called when an API request reports 401. Only acts when the epoch
-    // matches the current session, so stale clients cannot log out a
-    // newer login.
+    // Opens TikTok's official LIVE-access application page in a
+    // pass-through embedded browser for the user to drive themselves.
+    // No auth state machine is attached: the plugin never submits
+    // applications or reads their result.
+    void openLiveAccessApplication(QWidget *parent);
+
+    // Called when an API request reports 401 (invalid credential).
+    // Only acts when the epoch matches the current session, so stale
+    // clients cannot log out a newer login.
     void handleAuthFailure(uint64_t epoch);
+
+    // LIVE-access observations from API use (epoch-guarded like above).
+    // A 403 keeps the session: the credential is valid, the account is
+    // just not LIVE-eligible. A successful start proves eligibility.
+    void noteLiveStartSucceeded(uint64_t epoch);
+    void noteLiveAccessDenied(uint64_t epoch);
+
+    // Background re-validation of profile + eligibility with our own
+    // authorized GET /info (guarded against overlap and refresh storms).
+    // Also runs on a timer while authenticated so the status and the
+    // Apply button follow TikTok-side approvals automatically.
+    void refreshAccessState();
 
     // One-time migration of legacy plaintext tokens from
     // obs-multi-rtmp.json: each candidate is validated before it may
@@ -125,6 +149,9 @@ private:
     void teardownDialog();
     void scrubDialogSession();
     void pumpLegacyMigration();
+    void onApplyUrl(const QUrl &url);
+    void onApplyClosed();
+    void scheduleAccessRefresh();
 
     mutable std::mutex mutex_;
     std::string token_; // SECRET: memory only, never logged
@@ -138,6 +165,13 @@ private:
     // sanitize. Never logged.
     std::vector<std::string> pendingLegacy_;
 
+    // True once the user opened the LIVE-access application page this
+    // session without access being granted since. Drives the pending
+    // status line; reset on logout.
+    bool applyOpened_ = false;
+    bool refreshing_ = false;
+    std::chrono::steady_clock::time_point lastRefresh_{};
+
     std::unique_ptr<ICredentialStore> secureStore_;
     std::unique_ptr<ICredentialStore> memoryStore_;
     ICredentialStore *activeStore_ = nullptr;
@@ -148,7 +182,9 @@ private:
     bool reauthing_ = false;
     std::unique_ptr<TikTokAuthFlow> flow_;
     TikTokAuthDialog *dialog_ = nullptr;
+    TikTokAuthDialog *applyDialog_ = nullptr;
     QTimer *pollTimer_ = nullptr;
     QTimer *exchangeTimeout_ = nullptr;
     QTimer *overallTimeout_ = nullptr;
+    QTimer *refreshTimer_ = nullptr;
 };

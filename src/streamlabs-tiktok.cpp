@@ -414,6 +414,10 @@ TikTokAccountResult StreamlabsTikTokAPI::ParseAccountResponse(long httpCode, con
         }
         return false;
     };
+    result.account.applicationStatus = stringField(&json, "application_status");
+    if (result.account.applicationStatus.empty())
+        result.account.applicationStatus = stringField(user, "application_status");
+
     bool found = false;
     bool canBeLive = boolField(&json, "can_be_live", &found);
     if (!found)

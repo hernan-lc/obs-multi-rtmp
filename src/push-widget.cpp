@@ -429,9 +429,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 tiktokState_ = TikTokRuntimeState::Idle;
                 UnregisterTikTokActivityLocked();
             }
-            if (categoryResult.failure == TikTokFailure::Auth ||
-                categoryResult.failure == TikTokFailure::Forbidden)
+            if (categoryResult.failure == TikTokFailure::Auth)
                 TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
+            else if (categoryResult.failure == TikTokFailure::Forbidden)
+                TikTokAuthManager::instance().noteLiveAccessDenied(client->authEpoch());
             blog(LOG_WARNING, TAG "TikTok category lookup failed for '%s'.", config_->name.c_str());
             ShowTikTokError(TikTokFailureText(categoryResult.failure, true), categoryResult.error);
             return;
@@ -446,9 +447,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 tiktokState_ = TikTokRuntimeState::Idle;
                 UnregisterTikTokActivityLocked();
             }
-            if (startResult.failure == TikTokFailure::Auth ||
-                startResult.failure == TikTokFailure::Forbidden)
+            if (startResult.failure == TikTokFailure::Auth)
                 TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
+            else if (startResult.failure == TikTokFailure::Forbidden)
+                TikTokAuthManager::instance().noteLiveAccessDenied(client->authEpoch());
             blog(LOG_WARNING, TAG "TikTok LIVE creation failed for '%s'.", config_->name.c_str());
             ShowTikTokError(TikTokFailureText(startResult.failure, false), startResult.error);
             return;
@@ -473,6 +475,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             tiktokStreamId_ = startResult.streamId;
             tiktokClient_ = client;
         }
+        // Creating the LIVE proves eligibility even when /info never
+        // said so; hides the Apply button from here on.
+        TikTokAuthManager::instance().noteLiveStartSucceeded(client->authEpoch());
         blog(LOG_INFO, TAG "TikTok LIVE session created for '%s'.", config_->name.c_str());
 
         if (!obs_output_start(output_)) {

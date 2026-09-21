@@ -114,7 +114,13 @@ fuzzy-matches an unrelated game. Category suggestions appear as you type.
 - "TikTok session expired. Please log in again.": the stored credential
   was rejected; use "Login with TikTok" to reconnect.
 - "TikTok LIVE is not available for this account.": the linked
-  TikTok/Streamlabs account is not eligible for LIVE.
+  TikTok/Streamlabs account is not eligible for LIVE. Use the
+  "Apply for TikTok Live Permission" button next to the account status
+  to open TikTok's official application page in the embedded browser
+  and apply yourself; approval is TikTok's decision and may take time.
+  After applying, the status changes to pending, and the plugin
+  re-checks eligibility automatically (the button hides once access is
+  granted).
 - "Streamlabs rate limit reached." / "Streamlabs service temporarily
   unavailable.": wait and retry.
 - "Could not contact Streamlabs." / "Network unavailable — account status

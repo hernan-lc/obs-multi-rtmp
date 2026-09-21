@@ -22,7 +22,9 @@ class TikTokAuthDialog : public QDialog {
     Q_OBJECT
 
 public:
-    explicit TikTokAuthDialog(QWidget *parent = nullptr);
+    // Empty title keeps the default login caption; pass-through browsers
+    // (e.g. the LIVE-access application page) set their own.
+    explicit TikTokAuthDialog(QWidget *parent = nullptr, const QString &title = QString());
     ~TikTokAuthDialog() override;
 
     bool browserAvailable() const { return browser_ != nullptr; }

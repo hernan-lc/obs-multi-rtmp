@@ -81,6 +81,13 @@ QString SuccessPageId(const QUrl &url)
     return host + url.path();
 }
 
+bool IsLiveAccessResultUrl(const QUrl &url)
+{
+    if (!IsTikTokUrl(url))
+        return false;
+    return url.path().contains(QStringLiteral("live_access_pc_apply/result"));
+}
+
 QString LogSafeUrl(const QUrl &url)
 {
     return SuccessPageId(url);

@@ -6,6 +6,7 @@
 #include <QUrlQuery>
 
 #include "tiktok/auth-url.h"
+#include "tiktok/constants.h"
 
 static int g_checks = 0;
 #define CHECK(cond)                                                  \
@@ -119,6 +120,36 @@ static int TestTikTokLoginDetection()
     return 0;
 }
 
+static int TestLiveAccessApplyUrl()
+{
+    // Regression guard: the in-app application entry must stay on
+    // TikTok's official page (never a lookalike host).
+    const QUrl url(QString::fromLatin1(TikTokConstants::kLiveAccessApplyUrl));
+    CHECK(url.scheme() == "https");
+    CHECK(url.host() == "www.tiktok.com");
+    CHECK(url.path().contains("live_access_pc_apply"));
+    CHECK(TikTokAuthUrl::IsTikTokUrl(url));
+    CHECK(!TikTokAuthUrl::IsOAuthHost(url));
+    CHECK(!TikTokAuthUrl::ExtractAuthorizationCode(url).has_value());
+    return 0;
+}
+
+static int TestLiveAccessResultUrl()
+{
+    CHECK(TikTokAuthUrl::IsLiveAccessResultUrl(
+        QUrl("https://www.tiktok.com/falcon/live_g/live_access_pc_apply/result/index.html?id=GL1")));
+    CHECK(TikTokAuthUrl::IsLiveAccessResultUrl(
+        QUrl("https://tiktok.com/falcon/live_g/live_access_pc_apply/result/")));
+    // Intro page is not the result step.
+    CHECK(!TikTokAuthUrl::IsLiveAccessResultUrl(
+        QUrl("https://www.tiktok.com/falcon/live_g/live_access_pc_apply/intro/index.html?id=GL1")));
+    // Lookalike hosts never match.
+    CHECK(!TikTokAuthUrl::IsLiveAccessResultUrl(
+        QUrl("https://tiktok.com.evil.com/falcon/live_g/live_access_pc_apply/result/")));
+    CHECK(!TikTokAuthUrl::IsLiveAccessResultUrl(QUrl("https://www.tiktok.com/login")));
+    return 0;
+}
+
 static int TestLogSafeForms()
 {
     // Query strings (code, verifier) must never appear in log output.
@@ -149,6 +180,10 @@ int main()
     if (TestTikTokLoginDetection())
         return 1;
     if (TestLogSafeForms())
+        return 1;
+    if (TestLiveAccessApplyUrl())
+        return 1;
+    if (TestLiveAccessResultUrl())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;

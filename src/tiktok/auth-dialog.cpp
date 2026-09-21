@@ -137,10 +137,10 @@ void TikTokAuthDialog::clearPersistentData()
 #endif
 }
 
-TikTokAuthDialog::TikTokAuthDialog(QWidget *parent)
+TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title)
     : QDialog(parent)
 {
-    setWindowTitle(tr("Login with TikTok"));
+    setWindowTitle(title.isEmpty() ? tr("Login with TikTok") : title);
     setModal(true);
     resize(1000, 750);
 

@@ -51,6 +51,11 @@ struct TikTokAccountInfo {
     bool canGoLive = false;
     std::string liveUnavailableReason;
 
+    // Raw application status from /info when the API provides it
+    // (e.g. while an access application is under review). Displayed
+    // verbatim; the plugin never guesses its vocabulary.
+    std::string applicationStatus;
+
     std::string effectiveDisplayName() const { return displayName.empty() ? username : displayName; }
 };
 
