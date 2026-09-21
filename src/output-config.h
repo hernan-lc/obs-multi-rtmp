@@ -35,12 +35,24 @@ struct AudioEncoderConfig {
 using AudioEncoderConfigPtr = std::shared_ptr<AudioEncoderConfig>; 
 
 
+struct TikTokStreamConfig {
+    bool enabled = false;
+    // Streamlabs API credential. Persisted in the profile config file;
+    // see README for the security implications.
+    std::string token;
+    std::string title;
+    std::string category;
+    bool matureContent = false;
+};
+
 struct OutputTargetConfig {
     std::string id;
     std::string name;
     std::string protocol = "RTMP";
     bool syncStart = false;
     bool syncStop = false;
+
+    TikTokStreamConfig tiktok;
 
     nlohmann::json serviceParam;
     nlohmann::json outputParam;

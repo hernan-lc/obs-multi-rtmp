@@ -27,6 +27,15 @@ static nlohmann::json SaveTarget(OutputTargetConfig& config) {
     json["output-param"] = config.outputParam;
     json["sync-start"] = config.syncStart;
     json["sync-stop"] = config.syncStop;
+    {
+        nlohmann::json tiktok;
+        tiktok["enabled"] = config.tiktok.enabled;
+        tiktok["token"] = config.tiktok.token;
+        tiktok["title"] = config.tiktok.title;
+        tiktok["category"] = config.tiktok.category;
+        tiktok["mature-content"] = config.tiktok.matureContent;
+        json["tiktok"] = tiktok;
+    }
     if (config.videoConfig.has_value())
         json["video-config"] = *config.videoConfig;
     if (config.audioConfig.has_value())
@@ -127,6 +136,20 @@ static OutputTargetConfigPtr LoadTargetConfig(nlohmann::json& json) {
     config->protocol = GetJsonField<std::string>(json, "protocol").value_or("RTMP"); // for compatibility
     config->syncStart = GetJsonField<bool>(json, "sync-start").value_or(false);
     config->syncStop = GetJsonField<bool>(json, "sync-stop").value_or(config->syncStart);
+    if (auto tiktok = GetJsonField<nlohmann::json>(json, "tiktok")) {
+        config->tiktok.enabled = GetJsonField<bool>(*tiktok, "enabled").value_or(false);
+        config->tiktok.token = GetJsonField<std::string>(*tiktok, "token").value_or("");
+        config->tiktok.title = GetJsonField<std::string>(*tiktok, "title").value_or("");
+        config->tiktok.category = GetJsonField<std::string>(*tiktok, "category").value_or("");
+        config->tiktok.matureContent = GetJsonField<bool>(*tiktok, "mature-content").value_or(false);
+    } else {
+        // Migrate settings from the older flat layout; the credential itself
+        // is never migrated and must be re-entered in the TikTok settings.
+        config->tiktok.enabled = GetJsonField<bool>(json, "streamlabs-token").value_or(false);
+        config->tiktok.title = GetJsonField<std::string>(json, "streamlabs-title").value_or("");
+        config->tiktok.category = GetJsonField<std::string>(json, "streamlabs-category").value_or("");
+        config->tiktok.matureContent = GetJsonField<bool>(json, "streamlabs-mature-content").value_or(false);
+    }
     config->serviceParam = GetJsonField<nlohmann::json>(json, "service-param").value_or(nlohmann::json{});
     config->outputParam = GetJsonField<nlohmann::json>(json, "output-param").value_or(nlohmann::json{});
     config->videoConfig = GetJsonField<std::string>(json, "video-config");
