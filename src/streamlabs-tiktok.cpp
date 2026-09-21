@@ -1,4 +1,5 @@
 #include "streamlabs-tiktok.h"
+#include "tiktok/constants.h"
 
 #include <cctype>
 #include <memory>
@@ -11,17 +12,8 @@
 
 namespace {
 
-constexpr char kBaseUrl[] = "https://streamlabs.com/api/v5/slobs/tiktok";
-// The Streamlabs endpoints expect a Streamlabs Desktop client.
-constexpr char kUserAgent[] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "StreamlabsDesktop/1.17.0 Chrome/122.0.6261.156 "
-                              "Electron/29.3.1 Safari/537.36";
-constexpr long kConnectTimeoutMs = 5000;
-constexpr long kTotalTimeoutMs = 15000;
-constexpr size_t kMaxResponseBytes = 1024 * 1024;
-constexpr size_t kMaxCategoryQueryChars = 25;
 constexpr size_t kMaxDetailChars = 200;
+constexpr size_t kMaxCategoryEntries = 100;
 
 struct CurlEasyDeleter {
     void operator()(CURL *curl) const
@@ -66,7 +58,7 @@ size_t WriteResponse(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
     const size_t total = size * nmemb;
     auto *buf = static_cast<ResponseBuffer *>(userdata);
-    if (buf->data.size() + total > kMaxResponseBytes) {
+    if (buf->data.size() + total > TikTokConstants::kMaxResponseBytes) {
         buf->overflow = true;
         return 0; // aborts the transfer with CURLE_WRITE_ERROR
     }
@@ -76,9 +68,9 @@ size_t WriteResponse(char *ptr, size_t size, size_t nmemb, void *userdata)
 
 void ApplyCommonOptions(CURL *curl, ResponseBuffer *response)
 {
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, kUserAgent);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, kConnectTimeoutMs);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, kTotalTimeoutMs);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, TikTokConstants::kStreamlabsUserAgent);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, TikTokConstants::kConnectTimeoutMs);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, TikTokConstants::kTotalTimeoutMs);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     // TLS certificate verification stays at the libcurl default (enabled).
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteResponse);
@@ -360,6 +352,137 @@ TikTokCategoryResult StreamlabsTikTokAPI::ParseCategoryResponse(long httpCode, c
     return result;
 }
 
+TikTokAccountResult StreamlabsTikTokAPI::ParseAccountResponse(long httpCode, const std::string &body)
+{
+    TikTokAccountResult result;
+    if (httpCode < 200 || httpCode > 299) {
+        result.failure = ClassifyHttpStatus(httpCode);
+        result.error = WithServerMessage(DescribeHttpError(httpCode), body);
+        return result;
+    }
+
+    // Identity fields are advisory: a 2xx with an unexpected shape still
+    // proves the credential is valid, so it degrades to an empty profile
+    // instead of failing authentication.
+    nlohmann::json json;
+    try {
+        json = nlohmann::json::parse(body);
+    } catch (const std::exception &) {
+        result.failure = TikTokFailure::InvalidResponse;
+        result.error = "Invalid JSON in Streamlabs response.";
+        return result;
+    }
+    if (!json.is_object()) {
+        result.failure = TikTokFailure::InvalidResponse;
+        result.error = "Invalid JSON in Streamlabs response.";
+        return result;
+    }
+
+    const nlohmann::json *user = nullptr;
+    const auto userIt = json.find("user");
+    if (userIt != json.end() && userIt->is_object()) {
+        user = &(*userIt);
+    } else {
+        const auto dataIt = json.find("data");
+        if (dataIt != json.end() && dataIt->is_object()) {
+            const auto nested = dataIt->find("user");
+            if (nested != dataIt->end() && nested->is_object())
+                user = &(*nested);
+        }
+    }
+    auto stringField = [](const nlohmann::json *obj, const char *key) {
+        if (!obj)
+            return std::string();
+        const auto it = obj->find(key);
+        if (it != obj->end() && it->is_string())
+            return SanitizeDetail(it->get<std::string>());
+        return std::string();
+    };
+    if (user) {
+        result.account.username = stringField(user, "username");
+        result.account.displayName = stringField(user, "display_name");
+    }
+
+    // LIVE eligibility is only known when the API explicitly provides it.
+    auto boolField = [](const nlohmann::json *obj, const char *key, bool *found) {
+        if (!obj)
+            return false;
+        const auto it = obj->find(key);
+        if (it != obj->end() && it->is_boolean()) {
+            *found = true;
+            return it->get<bool>();
+        }
+        return false;
+    };
+    bool found = false;
+    bool canBeLive = boolField(&json, "can_be_live", &found);
+    if (!found)
+        canBeLive = boolField(user, "can_be_live", &found);
+    if (found) {
+        result.account.liveEligibilityKnown = true;
+        result.account.canGoLive = canBeLive;
+        if (!canBeLive) {
+            std::string reason = stringField(&json, "reason");
+            if (reason.empty())
+                reason = stringField(user, "reason");
+            std::string status = stringField(&json, "application_status");
+            if (status.empty())
+                status = stringField(user, "application_status");
+            if (!status.empty() && !reason.empty())
+                result.account.liveUnavailableReason = status + ": " + reason;
+            else if (!reason.empty())
+                result.account.liveUnavailableReason = reason;
+            else
+                result.account.liveUnavailableReason = status;
+        }
+    }
+
+    result.success = true;
+    result.failure = TikTokFailure::None;
+    return result;
+}
+
+TikTokCategoryListResult StreamlabsTikTokAPI::ParseCategoryListResponse(long httpCode, const std::string &body)
+{
+    TikTokCategoryListResult result;
+    if (httpCode < 200 || httpCode > 299) {
+        result.failure = ClassifyHttpStatus(httpCode);
+        result.error = WithServerMessage(DescribeHttpError(httpCode), body);
+        return result;
+    }
+
+    nlohmann::json json;
+    try {
+        json = nlohmann::json::parse(body);
+    } catch (const std::exception &) {
+        result.failure = TikTokFailure::InvalidResponse;
+        result.error = "Invalid JSON in Streamlabs response.";
+        return result;
+    }
+    if (json.is_object()) {
+        const auto categoriesIt = json.find("categories");
+        if (categoriesIt != json.end() && categoriesIt->is_array()) {
+            for (const auto &entry : *categoriesIt) {
+                if (result.categories.size() >= kMaxCategoryEntries)
+                    break;
+                if (!entry.is_object())
+                    continue;
+                const auto nameIt = entry.find("full_name");
+                if (nameIt == entry.end() || !nameIt->is_string() || nameIt->get<std::string>().empty())
+                    continue;
+                TikTokCategoryEntry item;
+                item.fullName = SanitizeDetail(nameIt->get<std::string>());
+                const auto idIt = entry.find("game_mask_id");
+                item.gameMaskId = (idIt != entry.end()) ? JsonValueToId(*idIt) : "";
+                result.categories.push_back(std::move(item));
+            }
+        }
+    }
+    result.success = true;
+    result.failure = TikTokFailure::None;
+    return result;
+}
+
 bool StreamlabsTikTokAPI::ParseEndResponse(long httpCode, const std::string &body, std::string *error)
 {
     if (httpCode < 200 || httpCode > 299) {
@@ -406,14 +529,14 @@ TikTokCategoryResult StreamlabsTikTokAPI::ResolveCategory(const std::string &tok
         return result;
     }
 
-    CurlEscaped escaped(
-        curl_easy_escape(curl.get(), TruncateToChars(category, kMaxCategoryQueryChars).c_str(), 0));
+    CurlEscaped escaped(curl_easy_escape(
+        curl.get(), TruncateToChars(category, TikTokConstants::kMaxCategoryQueryChars).c_str(), 0));
     if (!escaped) {
         result.failure = TikTokFailure::Network;
         result.error = "Failed to encode the category query.";
         return result;
     }
-    const std::string url = std::string(kBaseUrl) + "/info?category=" + escaped.get();
+    const std::string url = std::string(TikTokConstants::kApiBase) + "/info?category=" + escaped.get();
 
     CurlHeaders headers = MakeAuthHeaders(token);
     ResponseBuffer response;
@@ -447,6 +570,12 @@ TikTokCategoryResult StreamlabsTikTokAPI::ResolveCategory(const std::string &tok
 TikTokStartResult StreamlabsTikTokAPI::StartStream(const std::string &token, const std::string &title,
                                                   const std::string &categoryId, bool matureContent)
 {
+    return StartStream(token, title, categoryId, TikTokAudienceFromBool(matureContent));
+}
+
+TikTokStartResult StreamlabsTikTokAPI::StartStream(const std::string &token, const std::string &title,
+                                                  const std::string &categoryId, TikTokAudience audience)
+{
     TikTokStartResult result;
     if (token.empty()) {
         result.failure = TikTokFailure::Auth;
@@ -461,16 +590,17 @@ TikTokStartResult StreamlabsTikTokAPI::StartStream(const std::string &token, con
         return result;
     }
 
-    const std::string url = std::string(kBaseUrl) + "/stream/start";
+    const std::string url = std::string(TikTokConstants::kApiBase) + "/stream/start";
     CurlHeaders headers = MakeAuthHeaders(token);
 
     CurlMime mime(curl_mime_init(curl.get()));
-    const std::string audienceType = matureContent ? "1" : "0";
+    const std::string audienceType = TikTokAudienceApiValue(audience);
+    const std::string devicePlatform = TikTokConstants::DevicePlatform();
     const char *fields[][2] = {
         {"title", title.c_str()},
         {"category", categoryId.c_str()},
         {"audience_type", audienceType.c_str()},
-        {"device_platform", "win32"},
+        {"device_platform", devicePlatform.c_str()},
     };
     for (const auto &field : fields) {
         curl_mimepart *part = curl_mime_addpart(mime.get());
@@ -532,7 +662,7 @@ bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string 
             *error = "Failed to encode the TikTok stream id.";
         return false;
     }
-    const std::string url = std::string(kBaseUrl) + "/stream/" + escaped.get() + "/end";
+    const std::string url = std::string(TikTokConstants::kApiBase) + "/stream/" + escaped.get() + "/end";
 
     CurlHeaders headers = MakeAuthHeaders(token);
     ResponseBuffer response;
@@ -561,4 +691,108 @@ bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string 
     long httpCode = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpCode);
     return ParseEndResponse(httpCode, response.data, error);
+}
+
+TikTokAccountResult StreamlabsTikTokAPI::GetAccountInfo(const std::string &token)
+{
+    TikTokAccountResult result;
+    if (token.empty()) {
+        result.failure = TikTokFailure::Auth;
+        result.error = "Streamlabs credential is missing.";
+        return result;
+    }
+
+    CurlEasy curl(curl_easy_init());
+    if (!curl) {
+        result.failure = TikTokFailure::Network;
+        result.error = "Failed to initialize the HTTP client.";
+        return result;
+    }
+
+    const std::string url = std::string(TikTokConstants::kApiBase) + "/info";
+    CurlHeaders headers = MakeAuthHeaders(token);
+    ResponseBuffer response;
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPGET, 1L);
+    ApplyCommonOptions(curl.get(), &response);
+
+    const CURLcode code = curl_easy_perform(curl.get());
+    if (code == CURLE_WRITE_ERROR && response.overflow) {
+        result.failure = TikTokFailure::InvalidResponse;
+        result.error = "Streamlabs response exceeded the size limit.";
+        return result;
+    }
+    if (code == CURLE_OPERATION_TIMEDOUT) {
+        result.failure = TikTokFailure::Timeout;
+        result.error = "Request to Streamlabs timed out.";
+        return result;
+    }
+    if (code != CURLE_OK) {
+        result.failure = TikTokFailure::Network;
+        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+        return result;
+    }
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpCode);
+    return ParseAccountResponse(httpCode, response.data);
+}
+
+TikTokCategoryListResult StreamlabsTikTokAPI::ListCategories(const std::string &token, const std::string &query)
+{
+    TikTokCategoryListResult result;
+    if (token.empty()) {
+        result.failure = TikTokFailure::Auth;
+        result.error = "Streamlabs credential is missing.";
+        return result;
+    }
+    if (IsBlank(query)) {
+        result.success = true;
+        return result;
+    }
+
+    CurlEasy curl(curl_easy_init());
+    if (!curl) {
+        result.failure = TikTokFailure::Network;
+        result.error = "Failed to initialize the HTTP client.";
+        return result;
+    }
+
+    CurlEscaped escaped(curl_easy_escape(
+        curl.get(), TruncateToChars(query, TikTokConstants::kMaxCategoryQueryChars).c_str(), 0));
+    if (!escaped) {
+        result.failure = TikTokFailure::Network;
+        result.error = "Failed to encode the category query.";
+        return result;
+    }
+    const std::string url = std::string(TikTokConstants::kApiBase) + "/info?category=" + escaped.get();
+
+    CurlHeaders headers = MakeAuthHeaders(token);
+    ResponseBuffer response;
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPGET, 1L);
+    ApplyCommonOptions(curl.get(), &response);
+
+    const CURLcode code = curl_easy_perform(curl.get());
+    if (code == CURLE_WRITE_ERROR && response.overflow) {
+        result.failure = TikTokFailure::InvalidResponse;
+        result.error = "Streamlabs response exceeded the size limit.";
+        return result;
+    }
+    if (code == CURLE_OPERATION_TIMEDOUT) {
+        result.failure = TikTokFailure::Timeout;
+        result.error = "Request to Streamlabs timed out.";
+        return result;
+    }
+    if (code != CURLE_OK) {
+        result.failure = TikTokFailure::Network;
+        result.error = std::string("Could not contact Streamlabs: ") + curl_easy_strerror(code) + ".";
+        return result;
+    }
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpCode);
+    return ParseCategoryListResponse(httpCode, response.data);
 }

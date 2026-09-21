@@ -17,6 +17,19 @@ MultiOutputConfig& GlobalMultiOutputConfig()
     return instance;
 }
 
+static std::vector<std::string> &PendingLegacyTikTokTokens()
+{
+    static std::vector<std::string> tokens;
+    return tokens;
+}
+
+std::vector<std::string> ConsumeLegacyTikTokTokens()
+{
+    std::vector<std::string> tokens;
+    tokens.swap(PendingLegacyTikTokTokens());
+    return tokens;
+}
+
 
 static nlohmann::json SaveTarget(OutputTargetConfig& config) {
     nlohmann::json json;
@@ -28,12 +41,15 @@ static nlohmann::json SaveTarget(OutputTargetConfig& config) {
     json["sync-start"] = config.syncStart;
     json["sync-stop"] = config.syncStop;
     {
+        // Never serialized here: OAuth token, authorization code, PKCE
+        // verifier, RTMP key/URL, stream id, cookies. Those are runtime
+        // or secure-store state only.
         nlohmann::json tiktok;
         tiktok["enabled"] = config.tiktok.enabled;
-        tiktok["token"] = config.tiktok.token;
         tiktok["title"] = config.tiktok.title;
         tiktok["category"] = config.tiktok.category;
-        tiktok["mature-content"] = config.tiktok.matureContent;
+        tiktok["audience-type"] = TikTokAudienceApiValue(config.tiktok.audience);
+        tiktok["mature-content"] = config.tiktok.matureContent();
         json["tiktok"] = tiktok;
     }
     if (config.videoConfig.has_value())
@@ -138,17 +154,32 @@ static OutputTargetConfigPtr LoadTargetConfig(nlohmann::json& json) {
     config->syncStop = GetJsonField<bool>(json, "sync-stop").value_or(config->syncStart);
     if (auto tiktok = GetJsonField<nlohmann::json>(json, "tiktok")) {
         config->tiktok.enabled = GetJsonField<bool>(*tiktok, "enabled").value_or(false);
-        config->tiktok.token = GetJsonField<std::string>(*tiktok, "token").value_or("");
+        // Legacy plaintext token: diverted to the one-time migration
+        // sink, never kept on the config. Never logged.
+        if (auto legacy = GetJsonField<std::string>(*tiktok, "token")) {
+            if (!legacy->empty())
+                PendingLegacyTikTokTokens().push_back(*legacy);
+        }
         config->tiktok.title = GetJsonField<std::string>(*tiktok, "title").value_or("");
         config->tiktok.category = GetJsonField<std::string>(*tiktok, "category").value_or("");
-        config->tiktok.matureContent = GetJsonField<bool>(*tiktok, "mature-content").value_or(false);
+        if (auto audience = GetJsonField<std::string>(*tiktok, "audience-type")) {
+            config->tiktok.audience =
+                (*audience == "1") ? TikTokAudience::AdultOnly : TikTokAudience::Everyone;
+        } else if (auto audienceInt = GetJsonField<int>(*tiktok, "audience-type")) {
+            config->tiktok.audience =
+                (*audienceInt == 1) ? TikTokAudience::AdultOnly : TikTokAudience::Everyone;
+        } else {
+            config->tiktok.setMatureContent(
+                GetJsonField<bool>(*tiktok, "mature-content").value_or(false));
+        }
     } else {
         // Migrate settings from the older flat layout; the credential itself
-        // is never migrated and must be re-entered in the TikTok settings.
+        // is never migrated and must be re-entered via Login with TikTok.
         config->tiktok.enabled = GetJsonField<bool>(json, "streamlabs-token").value_or(false);
         config->tiktok.title = GetJsonField<std::string>(json, "streamlabs-title").value_or("");
         config->tiktok.category = GetJsonField<std::string>(json, "streamlabs-category").value_or("");
-        config->tiktok.matureContent = GetJsonField<bool>(json, "streamlabs-mature-content").value_or(false);
+        config->tiktok.setMatureContent(
+            GetJsonField<bool>(json, "streamlabs-mature-content").value_or(false));
     }
     config->serviceParam = GetJsonField<nlohmann::json>(json, "service-param").value_or(nlohmann::json{});
     config->outputParam = GetJsonField<nlohmann::json>(json, "output-param").value_or(nlohmann::json{});

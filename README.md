@@ -53,7 +53,7 @@ If you find this tool useful and want to doante, here is the link. (Please do no
 This project uses obs-plugintemplate.   
 Please refer to obs-plugintemplate to understand how it works.
 
-## TikTok LIVE via Streamlabs (Linux)
+## TikTok LIVE via Streamlabs
 
 Any output target can optionally stream to TikTok LIVE. When enabled, the
 plugin calls the Streamlabs API to create a TikTok LIVE session, receives a
@@ -66,49 +66,63 @@ This plugin does not grant LIVE permission to an account.
 
 ### Setup
 
-1. Get a Streamlabs token with the
-   [StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator)
-   project (the "Get Streamlabs Token" button in the target settings opens it).
-2. In the target settings, open the "TikTok / Streamlabs" section.
-3. Check "Enable TikTok via Streamlabs" and fill in the Streamlabs token,
-   stream title, category and mature-content flag.
-4. Keep the target protocol on RTMP and press Start.
+1. Add or edit an output target.
+2. Enable TikTok LIVE.
+3. Click "Login with TikTok".
+4. Sign into TikTok in the secure login window.
+5. Authorize the Streamlabs integration.
+6. When the plugin shows "Connected as @username", configure title/category.
+7. Start the output normally.
+
+No Streamlabs token, RTMP server, stream key, or authorization code ever
+needs to be copied or pasted: the plugin obtains and stores the OAuth
+credential automatically. If you previously used a manual Streamlabs token,
+it is migrated once into secure storage (when still valid) and removed
+from `obs-multi-rtmp.json`.
 
 The category must match a TikTok category name exactly (case-insensitive);
 unknown or empty categories stream under "Other". The plugin never
-fuzzy-matches an unrelated game.
+fuzzy-matches an unrelated game. Category suggestions appear as you type.
 
 ### Linux support
 
 - Native packages: build with the `ubuntu-x86_64` preset
   (`cmake --preset ubuntu-x86_64`). Requires libcurl development files
-  (`libcurl4-openssl-dev` on Ubuntu).
+  (`libcurl4-openssl-dev` on Ubuntu) and Qt 6 WebEngine development files
+  for the embedded login browser.
 - Flatpak: the existing `com.obsproject.Studio.Plugin.MultiRTMP` extension
   manifest works unchanged (libcurl ships with the Freedesktop SDK, network
   access is inherited from OBS). See [FLATPAK.md](./FLATPAK.md).
 
 ### Security notes
 
-- The Streamlabs credential is stored in plain text in the OBS profile file
-  `obs-multi-rtmp.json`. Anyone with read access to your OBS profile can read
-  it. OS keychain storage is a planned follow-up.
-- The credential is only ever sent to `https://streamlabs.com` over TLS with
-  certificate verification enabled. It is never logged and never placed in
-  RTMP URLs.
-- Generated RTMP server/key pairs and the TikTok session id are kept in
-  memory only and are never written to disk.
+- OAuth credentials are not stored in `obs-multi-rtmp.json`. The plugin
+  uses the operating system credential store when available (Secret
+  Service on Linux, Credential Manager on Windows, Keychain on macOS).
+  If secure storage is unavailable, the login stays valid in memory for
+  the current OBS session only, with a warning shown at login.
+- The credential is only ever sent to `https://streamlabs.com` over TLS
+  with certificate verification enabled. It is never logged and never
+  placed in RTMP URLs.
+- The login WebView handles TikTok/Streamlabs cookies in a dedicated
+  profile; generated RTMP server/key pairs remain in memory only.
+- Logging deliberately redacts authentication credentials and stream keys:
+  auth URLs are logged as host + path only, without query strings.
 
 ### Troubleshooting
 
-- "TikTok Streamlabs token is missing.": enablement requires the dedicated
-  Streamlabs token field, not the RTMP password field.
-- "Streamlabs authentication failed.": the token is invalid or expired;
-  generate a new one.
-- "TikTok LIVE access is not available for this account.": the linked
+- "TikTok session expired. Please log in again.": the stored credential
+  was rejected; use "Login with TikTok" to reconnect.
+- "TikTok LIVE is not available for this account.": the linked
   TikTok/Streamlabs account is not eligible for LIVE.
 - "Streamlabs rate limit reached." / "Streamlabs service temporarily
   unavailable.": wait and retry.
-- "Could not contact Streamlabs.": check network access and proxy settings.
-  Requests time out after 5 s (connect) / 15 s (total).
+- "Could not contact Streamlabs." / "Network unavailable — account status
+  unknown": check network access and proxy settings. Requests time out
+  after 5 s (connect) / 15 s (total); saved credentials are kept and
+  revalidated later.
+- "The embedded TikTok login browser (Qt WebEngine) is not available in
+  this build.": the package lacks the Qt WebEngine runtime; use a build
+  with WebEngine support.
 - The TikTok LIVE session is always ended when the output stops, including
-  forced stops, OBS shutdown and profile switches.
+  forced stops, failed starts, OBS shutdown and profile switches.

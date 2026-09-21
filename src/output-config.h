@@ -8,6 +8,7 @@
 #include <list>
 
 #include <json.hpp>
+#include "tiktok/auth-models.h"
 
 struct VideoEncoderConfig {
     std::string id;
@@ -37,12 +38,15 @@ using AudioEncoderConfigPtr = std::shared_ptr<AudioEncoderConfig>;
 
 struct TikTokStreamConfig {
     bool enabled = false;
-    // Streamlabs API credential. Persisted in the profile config file;
-    // see README for the security implications.
-    std::string token;
+    // NOTE: the OAuth token is account/session state owned by
+    // TikTokAuthManager. It is never part of target configuration and
+    // never serialized here.
     std::string title;
     std::string category;
-    bool matureContent = false;
+    TikTokAudience audience = TikTokAudience::Everyone;
+
+    bool matureContent() const { return TikTokAudienceIsMature(audience); }
+    void setMatureContent(bool mature) { audience = TikTokAudienceFromBool(mature); }
 };
 
 struct OutputTargetConfig {
@@ -87,3 +91,9 @@ void SaveMultiOutputConfig();
 bool LoadMultiOutputConfig();
 
 std::string GenerateId(MultiOutputConfig& config);
+
+// One-time migration sink for legacy plaintext tokens found in
+// obs-multi-rtmp.json. LoadTargetConfig collects them here instead of
+// storing them on the config; the auth manager validates and migrates
+// them, then the config is re-saved without any token.
+std::vector<std::string> ConsumeLegacyTikTokTokens();

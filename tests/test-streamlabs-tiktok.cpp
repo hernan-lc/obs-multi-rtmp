@@ -254,9 +254,115 @@ static int TestEmptyCredentialRejectedLocally()
     auto category = StreamlabsTikTokAPI::ResolveCategory("", "Minecraft");
     CHECK(!category.success);
 
+    auto account = StreamlabsTikTokAPI::GetAccountInfo("");
+    CHECK(!account.success);
+    CHECK(account.failure == TikTokFailure::Auth);
+
+    auto list = StreamlabsTikTokAPI::ListCategories("", "Minecraft");
+    CHECK(!list.success);
+
     std::string error;
     CHECK(!StreamlabsTikTokAPI::EndStream("", "123", &error));
     CHECK(!StreamlabsTikTokAPI::EndStream("tok", "", &error));
+    return 0;
+}
+
+static int TestAccountResponseValid()
+{
+    const std::string body =
+        R"({"user":{"username":"someuser","display_name":"Some User"},"categories":[]})";
+    auto r = StreamlabsTikTokAPI::ParseAccountResponse(200, body);
+    CHECK(r.success);
+    CHECK(r.failure == TikTokFailure::None);
+    CHECK(r.account.username == "someuser");
+    CHECK(r.account.displayName == "Some User");
+    CHECK(!r.account.liveEligibilityKnown);
+
+    // Nested data.user shape is tolerated too.
+    auto nested =
+        StreamlabsTikTokAPI::ParseAccountResponse(200, R"({"data":{"user":{"username":"u"}}})");
+    CHECK(nested.success);
+    CHECK(nested.account.username == "u");
+    return 0;
+}
+
+static int TestAccountResponseDegradesGracefully()
+{
+    // 2xx without identity fields still proves the credential: auth
+    // succeeds with a partial profile.
+    auto missing = StreamlabsTikTokAPI::ParseAccountResponse(200, R"({"ok":true})");
+    CHECK(missing.success);
+    CHECK(missing.account.username.empty());
+
+    auto noDisplay = StreamlabsTikTokAPI::ParseAccountResponse(200, R"({"user":{"username":"u"}})");
+    CHECK(noDisplay.success);
+    CHECK(noDisplay.account.displayName.empty());
+    return 0;
+}
+
+static int TestAccountLiveEligibility()
+{
+    const std::string body = R"({"user":{"username":"u"},"can_be_live":false,)"
+                               R"("application_status":"review","reason":"need followers"})";
+    auto r = StreamlabsTikTokAPI::ParseAccountResponse(200, body);
+    CHECK(r.success);
+    CHECK(r.account.liveEligibilityKnown);
+    CHECK(!r.account.canGoLive);
+    CHECK(r.account.liveUnavailableReason.find("followers") != std::string::npos);
+
+    auto eligible =
+        StreamlabsTikTokAPI::ParseAccountResponse(200, R"({"user":{"username":"u"},"can_be_live":true})");
+    CHECK(eligible.success);
+    CHECK(eligible.account.liveEligibilityKnown);
+    CHECK(eligible.account.canGoLive);
+    return 0;
+}
+
+static int TestAccountResponseHttpErrors()
+{
+    auto auth = StreamlabsTikTokAPI::ParseAccountResponse(401, "{}");
+    CHECK(!auth.success);
+    CHECK(auth.failure == TikTokFailure::Auth);
+
+    auto forbidden = StreamlabsTikTokAPI::ParseAccountResponse(403, "{}");
+    CHECK(forbidden.failure == TikTokFailure::Forbidden);
+
+    auto server = StreamlabsTikTokAPI::ParseAccountResponse(500, "{}");
+    CHECK(server.failure == TikTokFailure::Server);
+
+    auto bad = StreamlabsTikTokAPI::ParseAccountResponse(200, "not json");
+    CHECK(!bad.success);
+    CHECK(bad.failure == TikTokFailure::InvalidResponse);
+    return 0;
+}
+
+static int TestCategoryListResponse()
+{
+    const std::string body = R"({"categories":[
+        {"full_name":"Just Chatting","game_mask_id":"111"},
+        {"full_name":"Minecraft","game_mask_id":222},
+        {"full_name":"","game_mask_id":"x"},
+        {"nope":true}
+    ]})";
+    auto r = StreamlabsTikTokAPI::ParseCategoryListResponse(200, body);
+    CHECK(r.success);
+    CHECK(r.categories.size() == 2);
+    CHECK(r.categories[0].fullName == "Just Chatting");
+    CHECK(r.categories[0].gameMaskId == "111");
+    CHECK(r.categories[1].gameMaskId == "222");
+
+    // 2xx without categories: empty list, still success.
+    auto empty = StreamlabsTikTokAPI::ParseCategoryListResponse(200, R"({"ok":true})");
+    CHECK(empty.success);
+    CHECK(empty.categories.empty());
+
+    auto auth = StreamlabsTikTokAPI::ParseCategoryListResponse(401, "{}");
+    CHECK(!auth.success);
+    CHECK(auth.failure == TikTokFailure::Auth);
+
+    auto bad = StreamlabsTikTokAPI::ParseCategoryListResponse(200, "not json");
+    CHECK(!bad.success);
+    CHECK(bad.failure == TikTokFailure::InvalidResponse);
     return 0;
 }
 
@@ -287,6 +393,16 @@ int main()
     if (TestEndResponse())
         return 1;
     if (TestEmptyCredentialRejectedLocally())
+        return 1;
+    if (TestAccountResponseValid())
+        return 1;
+    if (TestAccountResponseDegradesGracefully())
+        return 1;
+    if (TestAccountLiveEligibility())
+        return 1;
+    if (TestAccountResponseHttpErrors())
+        return 1;
+    if (TestCategoryListResponse())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;

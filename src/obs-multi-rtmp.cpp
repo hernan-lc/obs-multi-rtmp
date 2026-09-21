@@ -9,6 +9,7 @@
 #include "plugin-support.h"
 
 #include "output-config.h"
+#include "tiktok/auth-manager.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -463,6 +464,14 @@ bool obs_module_load()
 
     blog(LOG_INFO, TAG "version: %s by SoraYuki https://github.com/sorayuki/obs-multi-rtmp/", PLUGIN_VERSION);
 
+    // The dock constructor already loaded the profile config (and diverted
+    // any legacy plaintext TikTok token to the migration sink). Restore the
+    // secure session first; migration runs only when no session exists.
+    QMetaObject::invokeMethod(mainwin, []() {
+        TikTokAuthManager::instance().restoreSession();
+        TikTokAuthManager::instance().migrateLegacyTokens(ConsumeLegacyTikTokTokens());
+    });
+
     obs_frontend_add_event_callback(
         [](enum obs_frontend_event event, void *private_data) {
             auto dock = static_cast<MultiOutputWidget*>(private_data);
@@ -471,12 +480,17 @@ bool obs_module_load()
                 x->OnOBSEvent(event);
 
             if (event == obs_frontend_event::OBS_FRONTEND_EVENT_EXIT)
-            {   
+            {
                 dock->SaveConfig();
             }
             else if (event == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED)
             {
                 dock->LoadConfig();
+                // The TikTok session is global, not per-profile, so no
+                // re-restore is needed; only migrate this profile's legacy
+                // token when logged out (otherwise it is discarded with a
+                // config sanitize).
+                TikTokAuthManager::instance().migrateLegacyTokens(ConsumeLegacyTikTokTokens());
             }
         }, dock
     );

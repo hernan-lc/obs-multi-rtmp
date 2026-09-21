@@ -2,14 +2,16 @@
 #include "output-config.h"
 #include "json-util.hpp"
 #include "obs.hpp"
+#include "streamlabs-tiktok.h"
+#include "tiktok/auth-manager.h"
+#include "tiktok/streamlabs-client.h"
 #include <QMenu>
 #include <QTabWidget>
 #include <qevent.h>
 #include <QComboBox>
-#include <QDesktopServices>
-#include <QUrl>
 
 #include <regex>
+#include <thread>
 
 #include "obs-properties-widget.h"
 #include "helpers.h"
@@ -248,10 +250,14 @@ class EditOutputWidgetImpl: public EditOutputWidget
     QCheckBox *syncStop_ = 0;
 
     QCheckBox* tiktokEnable_ = 0;
-    QLineEdit* tiktokToken_ = 0;
+    QLabel* tiktokAuthStatus_ = 0;
+    QPushButton* tiktokLoginButton_ = 0;
+    QPushButton* tiktokLogoutButton_ = 0;
     QLineEdit* tiktokTitle_ = 0;
-    QLineEdit* tiktokCategory_ = 0;
-    QCheckBox* tiktokMature_ = 0;
+    QComboBox* tiktokCategory_ = 0;
+    QComboBox* tiktokAudience_ = 0;
+    QTimer* tiktokCategoryDebounce_ = 0;
+    uint64_t tiktokCategoryGen_ = 0;
 
     std::vector<std::string> EnumEncodersByCodec(const char* codec)
     {
@@ -657,21 +663,53 @@ public:
                     auto tiktokLayout = new QGridLayout();
                     tiktokLayout->addWidget(tiktokEnable_ = new QCheckBox(obs_module_text("TikTok.Enable"), gp),
                                             0, 0, 1, 2);
-                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Token"), gp), 1, 0);
-                    tiktokLayout->addWidget(tiktokToken_ = new QLineEdit("", gp), 1, 1);
-                    tiktokToken_->setEchoMode(QLineEdit::Password);
-                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Title"), gp), 2, 0);
-                    tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", gp), 2, 1);
-                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Category"), gp), 3, 0);
-                    tiktokLayout->addWidget(tiktokCategory_ = new QLineEdit("", gp), 3, 1);
-                    tiktokLayout->addWidget(tiktokMature_ = new QCheckBox(obs_module_text("TikTok.MatureContent"), gp),
-                                            4, 0);
-                    auto getToken = new QPushButton(obs_module_text("TikTok.GetToken"), gp);
-                    QObject::connect(getToken, &QPushButton::clicked, []() {
-                        QDesktopServices::openUrl(QUrl("https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator"));
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Status"), gp), 1, 0);
+                    tiktokLayout->addWidget(tiktokAuthStatus_ = new QLabel(gp), 1, 1);
+                    tiktokAuthStatus_->setWordWrap(true);
+                    tiktokLayout->addWidget(
+                        tiktokLoginButton_ = new QPushButton(obs_module_text("TikTok.Login"), gp), 2, 0);
+                    tiktokLayout->addWidget(
+                        tiktokLogoutButton_ = new QPushButton(obs_module_text("TikTok.Logout"), gp), 2, 1);
+                    QObject::connect(tiktokLoginButton_, &QPushButton::clicked, [this]() {
+                        TikTokAuthManager::instance().login(this);
                     });
-                    tiktokLayout->addWidget(getToken, 4, 1);
+                    QObject::connect(tiktokLogoutButton_, &QPushButton::clicked, [this]() {
+                        TikTokAuthManager::instance().logout(this);
+                    });
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Title"), gp), 3, 0);
+                    tiktokLayout->addWidget(tiktokTitle_ = new QLineEdit("", gp), 3, 1);
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Category"), gp), 4, 0);
+                    tiktokLayout->addWidget(tiktokCategory_ = new QComboBox(gp), 4, 1);
+                    tiktokCategory_->setEditable(true);
+                    tiktokCategory_->setInsertPolicy(QComboBox::NoInsert);
+                    tiktokCategoryDebounce_ = new QTimer(this);
+                    tiktokCategoryDebounce_->setSingleShot(true);
+                    QObject::connect(tiktokCategory_->lineEdit(), &QLineEdit::textEdited, [this]() {
+                        tiktokCategoryDebounce_->start(400);
+                    });
+                    QObject::connect(tiktokCategoryDebounce_, &QTimer::timeout, [this]() {
+                        RunTikTokCategorySearch();
+                    });
+                    tiktokLayout->addWidget(new QLabel(obs_module_text("TikTok.Audience"), gp), 5, 0);
+                    tiktokLayout->addWidget(tiktokAudience_ = new QComboBox(gp), 5, 1);
+                    tiktokAudience_->addItem(obs_module_text("TikTok.AudienceEveryone"), "0");
+                    tiktokAudience_->addItem(obs_module_text("TikTok.AudienceAdult"), "1");
                     gp->setLayout(tiktokLayout);
+
+                    QObject::connect(&TikTokAuthManager::instance(),
+                                     &TikTokAuthManager::authenticationChanged, this,
+                                     [this]() { UpdateTikTokAuth(); });
+                    QObject::connect(&TikTokAuthManager::instance(), &TikTokAuthManager::loginFailed,
+                                     this, [this](const QString &message) {
+                                         if (message.isEmpty() ||
+                                             message ==
+                                                 QString::fromUtf8(obs_module_text("TikTok.LoginCancelled")))
+                                             return;
+                                         QMessageBox::warning(this,
+                                                               QString::fromUtf8(obs_module_text("TikTok.Settings")),
+                                                               message);
+                                     });
+                    UpdateTikTokAuth();
                 }
             }
             layout->addLayout(sub_grid, 1);
@@ -990,10 +1028,11 @@ public:
         config_->syncStart = syncStart_->isChecked();
         config_->syncStop = syncStop_->isChecked();
         config_->tiktok.enabled = tiktokEnable_->isChecked();
-        config_->tiktok.token = tostdu8(tiktokToken_->text());
         config_->tiktok.title = tostdu8(tiktokTitle_->text());
-        config_->tiktok.category = tostdu8(tiktokCategory_->text());
-        config_->tiktok.matureContent = tiktokMature_->isChecked();
+        config_->tiktok.category = tostdu8(tiktokCategory_->currentText());
+        config_->tiktok.audience = (tiktokAudience_->currentData().toString() == QStringLiteral("1"))
+                                       ? TikTokAudience::AdultOnly
+                                       : TikTokAudience::Everyone;
         config_->outputParam = outputSettings_->Save();
         config_->serviceParam = serviceSettings_->Save();
 
@@ -1036,10 +1075,73 @@ public:
         syncStart_->setChecked(target.syncStart);
         syncStop_->setChecked(target.syncStop);
         tiktokEnable_->setChecked(target.tiktok.enabled);
-        tiktokToken_->setText(QString::fromUtf8(target.tiktok.token));
         tiktokTitle_->setText(QString::fromUtf8(target.tiktok.title));
-        tiktokCategory_->setText(QString::fromUtf8(target.tiktok.category));
-        tiktokMature_->setChecked(target.tiktok.matureContent);
+        tiktokCategory_->blockSignals(true);
+        tiktokCategory_->clear();
+        if (!target.tiktok.category.empty())
+            tiktokCategory_->addItem(QString::fromUtf8(target.tiktok.category));
+        tiktokCategory_->setEditText(QString::fromUtf8(target.tiktok.category));
+        tiktokCategory_->blockSignals(false);
+        const int audienceIndex =
+            tiktokAudience_->findData(target.tiktok.matureContent() ? "1" : "0");
+        tiktokAudience_->setCurrentIndex(audienceIndex < 0 ? 0 : audienceIndex);
+    }
+
+    void UpdateTikTokAuth()
+    {
+        if (!tiktokAuthStatus_ || !tiktokLoginButton_ || !tiktokLogoutButton_)
+            return;
+        auto &auth = TikTokAuthManager::instance();
+        tiktokAuthStatus_->setText(auth.statusText());
+        const bool authenticated = auth.isAuthenticated();
+        const auto status = auth.status();
+        const bool busy = status == TikTokAuthManager::Status::LoggingIn ||
+                          status == TikTokAuthManager::Status::Validating;
+        tiktokLoginButton_->setVisible(!authenticated);
+        tiktokLogoutButton_->setVisible(authenticated);
+        tiktokLoginButton_->setEnabled(!busy);
+        tiktokLogoutButton_->setEnabled(!busy);
+    }
+
+    void RunTikTokCategorySearch()
+    {
+        auto client = TikTokAuthManager::instance().client();
+        if (!client || !tiktokCategory_)
+            return;
+        const std::string query = tostdu8(tiktokCategory_->currentText());
+        if (query.size() < 2)
+            return;
+        const uint64_t gen = ++tiktokCategoryGen_;
+        // Queued back to this dialog: if it is destroyed first, the
+        // callback is dropped and the stale-generation check covers
+        // superseded searches.
+        std::thread([this, client, query, gen]() {
+            auto result = client->SearchCategories(query);
+            QMetaObject::invokeMethod(
+                this,
+                [this, result = std::move(result), gen, epoch = client->authEpoch()]() {
+                    if (gen != tiktokCategoryGen_ || !tiktokCategory_)
+                        return;
+                    if (!result.success) {
+                        if (result.failure == TikTokFailure::Auth ||
+                            result.failure == TikTokFailure::Forbidden)
+                            TikTokAuthManager::instance().handleAuthFailure(epoch);
+                        return;
+                    }
+                    const QString current = tiktokCategory_->currentText();
+                    tiktokCategory_->blockSignals(true);
+                    tiktokCategory_->clear();
+                    for (const auto &entry : result.categories) {
+                        tiktokCategory_->addItem(QString::fromUtf8(entry.fullName),
+                                                 QString::fromUtf8(entry.gameMaskId));
+                    }
+                    tiktokCategory_->setEditText(current);
+                    tiktokCategory_->blockSignals(false);
+                    if (!result.categories.empty() && tiktokCategory_->hasFocus())
+                        tiktokCategory_->showPopup();
+                },
+                Qt::QueuedConnection);
+        }).detach();
     }
 
     using IdOrVideoConfig = std::variant<std::string_view, VideoEncoderConfig*>;

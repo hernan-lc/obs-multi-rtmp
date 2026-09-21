@@ -148,3 +148,22 @@ wsl -e flatpak run com.obsproject.Studio
 `flatpak/com.obsproject.Studio.Plugin.MultiRTMP.metainfo.xml` 的 release 版本和日期
 同步到正式发布版本。Flathub 通常还需要一个独立打包仓库及 `flathub.json`；其中
 `only-arches` 应与实际测试过的架构一致。
+
+## TikTok 登录：WebEngine 与凭据存储
+
+TikTok 登录使用内嵌的 Qt WebEngine 浏览器完成 TikTok/Streamlabs 交互授权，
+其余 API 调用（`/info`、分类搜索、创建/结束 LIVE）仍是原生 C++ HTTPS 请求。
+
+- 构建期：CMake 会独立探测 `Qt6::WebEngineCore` /
+  `Qt6::WebEngineWidgets`（"有 Qt Widgets" 不等于 "有 Qt WebEngine"）。
+  缺失时构建仍能成功，但登录对话框会提示当前包不支持内嵌登录，
+  不会回退到手动 token。
+- 运行期：除编译通过外，还必须在最终 OBS Flatpak 沙箱内确认
+  `QtWebEngineProcess` 及 resources/locales 存在且可启动，并验证登录窗口
+  能打开 TikTok 与 Streamlabs 页面、Cookie 与 JavaScript 正常工作。
+- 扩展清单（`build-extension: true`）继承 OBS 主应用的沙箱权限，扩展自身
+  无法追加 D-Bus 权限。Linux 凭据后端通过 `dlopen` 使用 Secret Service
+  （libsecret）；若沙箱内无法访问 `org.freedesktop.secrets`，插件自动降级为
+  内存会话（本次 OBS 运行有效，重启后需重新登录），绝不会静默写入明文 token。
+- 必须在打包后的 Flatpak 环境（而不仅是开发机）复测登录、会话恢复与登出，
+  再宣布该平台支持 TikTok 登录。
