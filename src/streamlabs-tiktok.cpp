@@ -538,8 +538,10 @@ TikTokCategoryListResult StreamlabsTikTokAPI::ParseCategoryListResponse(long htt
     return result;
 }
 
-bool StreamlabsTikTokAPI::ParseEndResponse(long httpCode, const std::string &body, std::string *error)
+bool StreamlabsTikTokAPI::ParseEndResponse(long httpCode, const std::string &body, std::string *error,
+                                          TikTokFailure *failure)
 {
+    if (failure) *failure = ClassifyHttpStatus(httpCode);
     if (httpCode < 200 || httpCode > 299) {
         if (error)
             *error = WithServerMessage(DescribeHttpError(httpCode), body);
@@ -561,6 +563,7 @@ bool StreamlabsTikTokAPI::ParseEndResponse(long httpCode, const std::string &bod
     } catch (...) {
         // A 2xx with a non-JSON body still counts as success.
     }
+    if (failure) *failure = TikTokFailure::None;
     return true;
 }
 
@@ -675,9 +678,12 @@ TikTokStartResult StreamlabsTikTokAPI::StartStream(const std::string &token, con
     return ParseStartResponse(httpCode, response.data);
 }
 
-bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string &streamId, std::string *error)
+bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string &streamId, std::string *error,
+                                   TikTokFailure *failure)
 {
+    if (failure) *failure = TikTokFailure::InvalidResponse;
     if (token.empty()) {
+        if (failure) *failure = TikTokFailure::Auth;
         if (error)
             *error = "Streamlabs credential is missing.";
         return false;
@@ -714,6 +720,7 @@ bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string 
     TikTokFailure transportFailure = TikTokFailure::None;
     std::string transportError;
     if (MapCurlError(code, response, &transportFailure, &transportError)) {
+        if (failure) *failure = transportFailure;
         if (error)
             *error = transportError;
         return false;
@@ -721,7 +728,9 @@ bool StreamlabsTikTokAPI::EndStream(const std::string &token, const std::string 
 
     long httpCode = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpCode);
-    return ParseEndResponse(httpCode, response.data, error);
+    const bool success = ParseEndResponse(httpCode, response.data, error, failure);
+    if (success && failure) *failure = TikTokFailure::None;
+    return success;
 }
 
 TikTokAccountResult StreamlabsTikTokAPI::GetAccountInfo(const std::string &token)

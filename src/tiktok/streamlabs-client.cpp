@@ -28,7 +28,7 @@ TikTokStartResult StreamlabsTikTokClient::StartStream(const std::string &title,
     return StreamlabsTikTokAPI::StartStream(token_, title, categoryId, audience);
 }
 
-bool StreamlabsTikTokClient::EndStream(const std::string &streamId, std::string *error)
+bool StreamlabsTikTokClient::EndStream(const std::string &streamId, std::string *error, TikTokFailure *failure)
 {
-    return StreamlabsTikTokAPI::EndStream(token_, streamId, error);
+    return StreamlabsTikTokAPI::EndStream(token_, streamId, error, failure);
 }

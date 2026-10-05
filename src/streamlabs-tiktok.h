@@ -121,7 +121,8 @@ public:
     static TikTokStartResult StartStream(const std::string &token, const std::string &title,
                                          const std::string &categoryId, TikTokAudience audience);
 
-    static bool EndStream(const std::string &token, const std::string &streamId, std::string *error = nullptr);
+    static bool EndStream(const std::string &token, const std::string &streamId, std::string *error = nullptr,
+                          TikTokFailure *failure = nullptr);
 
     static TikTokCategoryResult ResolveCategory(const std::string &token, const std::string &category);
 
@@ -134,7 +135,8 @@ public:
                                                       const std::string &wantedCategory);
     static TikTokAccountResult ParseAccountResponse(long httpCode, const std::string &body);
     static TikTokCategoryListResult ParseCategoryListResponse(long httpCode, const std::string &body);
-    static bool ParseEndResponse(long httpCode, const std::string &body, std::string *error);
+    static bool ParseEndResponse(long httpCode, const std::string &body, std::string *error,
+                                 TikTokFailure *failure = nullptr);
 
     // Truncates to at most maxChars Unicode code points without splitting a
     // UTF-8 sequence. Used for the category query (the API rejects long

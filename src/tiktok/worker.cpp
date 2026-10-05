@@ -153,6 +153,7 @@ void TikTokWorkerService::shutdown()
     if (!shuttingDown_.compare_exchange_strong(expected, true)) {
         normalPool_.waitForDone(-1);
         cleanupPool_.waitForDone(-1);
+        QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
         return;
     }
     {
@@ -168,4 +169,7 @@ void TikTokWorkerService::shutdown()
     // timeout (curl) or bus timeout (credential store).
     normalPool_.waitForDone(-1);
     cleanupPool_.waitForDone(-1);
+    // Queued completions own plugin functors (and unadopted results).
+    // Destroy them before unload, while terminal cleanup can still run.
+    QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
 }

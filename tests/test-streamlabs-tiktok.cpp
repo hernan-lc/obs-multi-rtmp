@@ -239,7 +239,15 @@ static int TestEndResponse()
     CHECK(!error.empty());
     // 2xx with a non-JSON body still counts as ended.
     CHECK(StreamlabsTikTokAPI::ParseEndResponse(200, "ok", &error));
-    CHECK(!StreamlabsTikTokAPI::ParseEndResponse(404, "{}", &error));
+    TikTokFailure failure = TikTokFailure::None;
+    CHECK(!StreamlabsTikTokAPI::ParseEndResponse(404, "{}", &error, &failure));
+    CHECK(failure == TikTokFailure::NotFound);
+    CHECK(!StreamlabsTikTokAPI::ParseEndResponse(401, "{}", &error, &failure));
+    CHECK(failure == TikTokFailure::Auth);
+    CHECK(!StreamlabsTikTokAPI::ParseEndResponse(200, R"({"success":false})", &error, &failure));
+    CHECK(failure == TikTokFailure::InvalidResponse);
+    CHECK(StreamlabsTikTokAPI::ParseEndResponse(200, "ok", &error, &failure));
+    CHECK(failure == TikTokFailure::None);
     CHECK(!error.empty());
     return 0;
 }

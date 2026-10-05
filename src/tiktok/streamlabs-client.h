@@ -27,7 +27,8 @@ public:
     TikTokCategoryResult ResolveCategory(const std::string &category);
     TikTokStartResult StartStream(const std::string &title, const std::string &categoryId,
                                   TikTokAudience audience);
-    bool EndStream(const std::string &streamId, std::string *error = nullptr);
+    bool EndStream(const std::string &streamId, std::string *error = nullptr,
+                   TikTokFailure *failure = nullptr);
 
 private:
     std::string token_;

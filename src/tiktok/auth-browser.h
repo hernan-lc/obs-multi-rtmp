@@ -21,6 +21,7 @@ class TikTokAuthBrowser : public QObject {
 public:
     using QObject::QObject;
 
+    virtual QUrl currentUrl() const = 0;
     virtual void navigate(const QUrl &url) = 0;
     virtual void runJavaScript(const QString &code, std::function<void(const QVariant &)> callback) = 0;
     virtual QWidget *widget() = 0;

@@ -126,8 +126,12 @@ static int TestExchangePageFence()
     return 0;
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--emit-starter") {
+        std::cout << BuildExchangeStartJs("https://fixture.invalid/exchange", "streamlabs.com/dashboard");
+        return 0;
+    }
     if (TestPendingPayloads())
         return 1;
     if (TestValidTokenResponse())

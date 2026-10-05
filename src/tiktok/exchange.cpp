@@ -85,6 +85,8 @@ std::string BuildExchangeStartJs(const std::string &exchangeUrl, const std::stri
     js += "  if (P !== EP) return 'wrong-page';\n";
     js += "  var r = window.__multirtmp_tiktok_exchange;\n";
     js += "  if (r != null && (r.page === EP || r.success === true)) return 'kept';\n";
+    js += "  if (window.__multirtmp_tiktok_exchange_inflight) return 'in-progress';\n";
+    js += "  window.__multirtmp_tiktok_exchange_inflight = true;\n";
     js += "  window.__multirtmp_tiktok_exchange_seq = ((window.__multirtmp_tiktok_exchange_seq | 0) + 1);\n";
     js += "  var mySeq = window.__multirtmp_tiktok_exchange_seq;\n";
     js += "  window.__multirtmp_tiktok_exchange = null;\n";
@@ -93,6 +95,7 @@ std::string BuildExchangeStartJs(const std::string &exchangeUrl, const std::stri
     js += "    return name + String((err && err.message) || err);\n";
     js += "  }\n";
     js += "  function store(obj) {\n";
+    js += "    window.__multirtmp_tiktok_exchange_inflight = false;\n";
     js += "    obj.page = P;\n";
     js += "    if (window.__multirtmp_tiktok_exchange_seq === mySeq) window.__multirtmp_tiktok_exchange = obj;\n";
     js += "  }\n";

@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QMessageBox>
 #include <QPointer>
+#include <QCoreApplication>
 #include <QTimer>
 #include <QUrl>
 #include <QVariant>
@@ -71,6 +72,7 @@ TikTokAuthManager &TikTokAuthManager::instance()
 TikTokAuthManager::TikTokAuthManager(QObject *parent)
     : QObject(parent)
 {
+    deferredContext_ = new QObject(this);
     secureStore_ = CreateSecureCredentialStore();
     memoryStore_ = std::make_unique<MemoryCredentialStore>();
     activeStore_ = secureStore_ ? secureStore_.get() : memoryStore_.get();
@@ -394,7 +396,7 @@ void TikTokAuthManager::pumpLegacyMigration()
             }
             blog(LOG_INFO, TAG "TikTok: legacy migration deferred (temporary failure)");
             setStatus(Status::NetworkUnknown);
-            QTimer::singleShot(kMigrationRetryMs, this, [this]() { pumpLegacyMigration(); });
+            QTimer::singleShot(kMigrationRetryMs, deferredContext_, [this]() { pumpLegacyMigration(); });
         },
         false);
     if (!job) {
@@ -455,6 +457,10 @@ void TikTokAuthManager::login(QWidget *parent)
                                       Qt::QueuedConnection);
     });
 
+    QObject::connect(dialog_, &QObject::destroyed, this, [this, attempt]() {
+        if (loginActive_ && attempt == loginAttempt_) cancelLogin();
+    });
+
     stopLoginTimers();
     overallTimeout_ = new QTimer(this);
     overallTimeout_->setSingleShot(true);
@@ -462,6 +468,37 @@ void TikTokAuthManager::login(QWidget *parent)
         finishLoginAttempt(attempt, QString::fromUtf8(obs_module_text("TikTok.LoginTimeout")));
     });
     overallTimeout_->start(kOverallTimeoutMs);
+
+    lastPolledUrl_ = QUrl();
+    authUrlPollInProgress_ = false;
+    authUrlPollTimer_ = new QTimer(this);
+    authUrlPollTimer_->setInterval(1500);
+    QObject::connect(authUrlPollTimer_, &QTimer::timeout, this, [this, attempt]() {
+        if (!loginActive_ || attempt != loginAttempt_ || !dialog_ || authUrlPollInProgress_)
+            return;
+        const auto current = dialog_->currentUrl();
+        if (current != lastPolledUrl_) {
+            lastPolledUrl_ = current;
+            onDialogUrl(attempt, current);
+        }
+        // Read the document URL too: history.pushState/replaceState may
+        // change SPA location without a normal navigation notification.
+        if (!dialog_) return;
+        authUrlPollInProgress_ = true;
+        QPointer<TikTokAuthManager> self(this);
+        dialog_->runJavaScript(QStringLiteral("window.location.href"),
+            [self, attempt](const QVariant &result) {
+                if (!self || !self->loginActive_ || attempt != self->loginAttempt_) return;
+                self->authUrlPollInProgress_ = false;
+                const QUrl url(result.toString());
+                if (!url.isEmpty() && url != self->lastPolledUrl_) {
+                    self->lastPolledUrl_ = url;
+                    self->onDialogUrl(attempt, url);
+                }
+            });
+    });
+    authUrlPollTimer_->start();
+    blog(LOG_INFO, TAG "[TikTokAuth] Browser opened");
 
     dialog_->navigate(QUrl(QString::fromLatin1(TikTokConstants::kTikTokLoginUrl)));
     dialog_->show();
@@ -818,14 +855,13 @@ void TikTokAuthManager::onDialogUrl(uint64_t attempt, const QUrl &url)
         if (!loginActive_ || attempt != loginAttempt_ || !flow_)
             return;
     }
-    blog(LOG_DEBUG, TAG "TikTok: auth navigation %s",
-         TikTokAuthUrl::LogSafeUrl(url).toUtf8().constData());
+    blog(LOG_DEBUG, TAG "[TikTokAuth] Navigation observed");
 
     QString code;
     const auto action = flow_->onNavigate(url, &code);
     switch (action) {
     case TikTokAuthFlow::NavAction::ScheduleRecheck:
-        QTimer::singleShot(kTikTokRecheckDelayMs, this, [this, attempt]() {
+        QTimer::singleShot(kTikTokRecheckDelayMs, deferredContext_, [this, attempt]() {
             std::optional<QUrl> target;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -840,7 +876,7 @@ void TikTokAuthManager::onDialogUrl(uint64_t attempt, const QUrl &url)
         });
         break;
     case TikTokAuthFlow::NavAction::Exchange:
-        blog(LOG_INFO, TAG "TikTok: authorization received, exchanging token");
+        blog(LOG_INFO, TAG "[TikTokAuth] Authorization code detected; token exchange started");
         startExchange(attempt, code, flow_->exchangePage());
         break;
     case TikTokAuthFlow::NavAction::None:
@@ -860,7 +896,7 @@ void TikTokAuthManager::onDialogLoad(uint64_t attempt, bool ok, const QUrl &url)
         // document; permit a single retry once the correct success
         // document finishes loading.
         if (flow_->shouldReeval(TikTokAuthUrl::SuccessPageId(url))) {
-            blog(LOG_DEBUG, TAG "TikTok: retrying exchange in committed document");
+            blog(LOG_DEBUG, TAG "[TikTokAuth] Token exchange retry requested in committed document");
             flow_->markReevalDone();
             retry = true;
         }
@@ -962,7 +998,7 @@ void TikTokAuthManager::pollExchange(uint64_t attempt)
             finishLoginAttempt(attempt, QString::fromUtf8(obs_module_text("TikTok.LoginFailed")));
             return;
         }
-        blog(LOG_INFO, TAG "TikTok: token received, validating account");
+        blog(LOG_INFO, TAG "[TikTokAuth] Token received; token validation started");
         bool isReauth = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1044,7 +1080,7 @@ void TikTokAuthManager::saveLoginCredential(uint64_t attempt, const std::string 
 {
     ICredentialStore *primary = secureStore_ ? secureStore_.get() : memoryStore_.get();
     ICredentialStore *memory = memoryStore_.get();
-    QWidget *notifyParent = dialog_ ? dialog_->parentWidget() : nullptr;
+    QPointer<QWidget> notifyParent = dialog_ ? dialog_->parentWidget() : nullptr;
     struct SaveOutcome {
         bool secureSaved = false;
     };
@@ -1141,6 +1177,13 @@ void TikTokAuthManager::finishLoginAttempt(uint64_t attempt, const QString &erro
 
 void TikTokAuthManager::stopLoginTimers()
 {
+    if (authUrlPollTimer_) {
+        authUrlPollTimer_->stop();
+        authUrlPollTimer_->deleteLater();
+        authUrlPollTimer_ = nullptr;
+    }
+    authUrlPollInProgress_ = false;
+    lastPolledUrl_ = QUrl();
     if (pollTimer_) {
         pollTimer_->stop();
         pollTimer_->deleteLater();
@@ -1176,6 +1219,9 @@ void TikTokAuthManager::scrubDialogSession()
 
 void TikTokAuthManager::shutdown()
 {
+    const std::vector<QTimer *> timers = {authUrlPollTimer_, pollTimer_, exchangeTimeout_, overallTimeout_, refreshTimer_};
+    auto *loginDialog = dialog_.data();
+    auto *applyDialog = applyDialog_.data();
     stopLoginTimers();
     if (refreshTimer_)
         refreshTimer_->stop();
@@ -1187,11 +1233,24 @@ void TikTokAuthManager::shutdown()
         reauthing_ = false;
         restoring_ = false;
         refreshing_ = false;
+        token_.clear();
+        account_.reset();
+        status_ = Status::LoggedOut;
+        ++authEpoch_;
     }
     teardownDialog();
     if (applyDialog_)
         applyDialog_->close();
     flow_.reset();
+    // Destroy browser callbacks and timer functors while the plugin is
+    // still mapped; deleteLater alone is insufficient during unload.
+    delete loginDialog;
+    delete applyDialog;
+    for (auto *timer : timers) delete timer;
+    refreshTimer_ = nullptr;
+    delete deferredContext_;
+    deferredContext_ = nullptr;
+    QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
     // Joins every worker thread (cancelling normal jobs, running cleanup
     // jobs to completion), so no plugin code runs after module unload.
     TikTokWorkerService::instance().shutdown();

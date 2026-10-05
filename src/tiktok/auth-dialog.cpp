@@ -35,16 +35,18 @@ protected:
 
 class WebEngineBrowser : public TikTokAuthBrowser {
 public:
-    explicit WebEngineBrowser(QWidget *parent)
+    explicit WebEngineBrowser(QWidget *parent) : TikTokAuthBrowser(parent)
     {
         profile_ = new QWebEngineProfile(QString::fromLatin1(TikTokConstants::kWebViewProfileName),
                                          this);
         profile_->setPersistentStoragePath(TikTokAuthDialog::profileStoragePath());
+        profile_->setHttpUserAgent(QString::fromLatin1(TikTokConstants::kStreamlabsUserAgent));
         profile_->setHttpCacheType(QWebEngineProfile::DiskHttpCache);
         profile_->setPersistentCookiesPolicy(QWebEngineProfile::AllowPersistentCookies);
 
         auto *settings = profile_->settings();
         settings->setAttribute(QWebEngineSettings::JavascriptEnabled, true);
+        settings->setAttribute(QWebEngineSettings::LocalStorageEnabled, true);
         settings->setAttribute(QWebEngineSettings::PluginsEnabled, false);
         settings->setAttribute(QWebEngineSettings::FullScreenSupportEnabled, false);
         settings->setAttribute(QWebEngineSettings::ScreenCaptureEnabled, false);
@@ -77,6 +79,16 @@ public:
             emit loadFinished(ok, view_ ? view_->url() : QUrl());
         });
     }
+
+    ~WebEngineBrowser() override
+    {
+        // Pages must be destroyed before their profile; the view belongs to the dialog.
+        delete view_;
+        delete page_;
+        delete profile_;
+    }
+
+    QUrl currentUrl() const override { return view_ ? view_->url() : QUrl(); }
 
     void navigate(const QUrl &url) override
     {
@@ -168,6 +180,11 @@ TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title)
 }
 
 TikTokAuthDialog::~TikTokAuthDialog() = default;
+
+QUrl TikTokAuthDialog::currentUrl() const
+{
+    return browser_ ? browser_->currentUrl() : QUrl();
+}
 
 void TikTokAuthDialog::navigate(const QUrl &url)
 {

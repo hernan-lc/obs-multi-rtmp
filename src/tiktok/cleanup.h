@@ -2,9 +2,9 @@
 
 // Claim-once ledger for TikTok LIVE cleanup. Every successful
 // POST /stream/start must eventually produce exactly one
-// POST /stream/<id>/end when OBS does not keep streaming, no matter
-// how many stop paths race (normal/forced stop, cancel, shutdown,
-// target deletion). Claiming is the single serialization point, so
+// POST /stream/<id>/end when its owner is destroyed or an unadopted
+// creation result is discarded. Local OBS stop/failure never claims
+// cleanup. Claiming is the single serialization point, so
 // double cleanup of the same id is impossible.
 //
 // Qt-free and OBS-free for unit testing.

@@ -29,6 +29,7 @@ public:
 
     bool browserAvailable() const { return browser_ != nullptr; }
 
+    QUrl currentUrl() const;
     void navigate(const QUrl &url);
     void runJavaScript(const QString &code, std::function<void(const QVariant &)> callback);
     void clearSessionData();

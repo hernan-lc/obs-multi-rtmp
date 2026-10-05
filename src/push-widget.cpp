@@ -6,6 +6,8 @@
 #include <mutex>
 #include <QCoreApplication>
 #include <QThread>
+#include <QPointer>
+#include <QMetaObject>
 #include "push-widget.h"
 #include "edit-widget.h"
 #include "output-config.h"
@@ -127,31 +129,33 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     obs_view_t* scene_view_ = 0;
     bool isUseDelay_ = false;
 
-    // TikTok LIVE runtime state. Never serialized. Guarded because
-    // cleanup runs both on the UI thread (stop/shutdown paths) and on
-    // output signal threads (OnStopped).
-    enum class TikTokRuntimeState {
-        Idle,
-        Preparing,
-        Cancelling,
-        LiveCreated,
-        Streaming,
-        Stopping,
-    };
-    std::mutex tiktokMutex_;
-    TikTokRuntimeState tiktokState_ = TikTokRuntimeState::Idle;
-    std::string tiktokStreamId_;
-    // Cleanup credential for the active LIVE, memory only. A copy owned
-    // by this widget so logout (blocked while active) and session
-    // expiry can never strand an un-endable session.
-    std::shared_ptr<StreamlabsTikTokClient> tiktokClient_;
+    // Remote resources are independent from the local OBS output. UI thread only.
+    enum class TikTokSessionState { Idle, Authenticating, CreatingEndpoint,
+                                    EndpointReady, EndingEndpoint, Error };
+    struct TikTokSession {
+        TikTokSessionState state = TikTokSessionState::Idle;
+        std::string streamId, server, streamKey;
+        std::shared_ptr<StreamlabsTikTokClient> client;
+        bool HasEndpoint() const
+        { return !streamId.empty() && !server.empty() && !streamKey.empty(); }
+        void Reset() { *this = TikTokSession{}; }
+    } tiktokSession_;
+    enum class RestreamState { Stopped, Preparing, Connecting, Streaming, Stopping };
+    RestreamState restreamState_ = RestreamState::Stopped;
     uint64_t tiktokRequestGen_ = 0;
+    std::atomic<uint64_t> outputGeneration_{0};
+    friend struct TikTokLifecycleTest;
+    bool startRestreamWhenReady_ = false;
+    bool endAfterStop_ = false;
+    bool endpointCreationUncertain_ = false;
+    QPushButton *create_live_btn_ = nullptr;
+    QPushButton *end_live_btn_ = nullptr;
 
     QPushButton* GetDeleteButton() {
         return remove_btn_;
     }
 
-    bool PrepareOutputService()
+    bool PrepareOutputService(const std::string &server = {}, const std::string &streamKey = {})
     {
         if (!output_) {
             blog(LOG_ERROR, TAG "Prepare output service before output object is created.");
@@ -160,7 +164,11 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         
         ReleaseOutputService();
         
-        auto conf = obs_data_create_from_json(config_->serviceParam.dump().c_str());
+        OBSDataAutoRelease conf = obs_data_create_from_json(config_->serviceParam.dump().c_str());
+        if (conf && config_->tiktok.enabled) {
+            obs_data_set_string(conf, "server", server.c_str());
+            obs_data_set_string(conf, "key", streamKey.c_str());
+        }
 
         auto protocolInfo = GetProtocolInfos()->GetInfo(config_->protocol.c_str());
         assert(protocolInfo);
@@ -174,7 +182,6 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             return false;
         
         auto service = obs_service_create(service_id, "multi-output-service", conf, nullptr);
-        obs_data_release(conf);
         if (!service)
             return false;
         obs_output_set_service(output_, service);
@@ -301,26 +308,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     void ShowTikTokError(const char *prefix, const std::string &detail)
     {
         QString msg = QString::fromUtf8(prefix);
-        // Detail comes from the API client and never contains credentials.
+        // API details are displayed only, never sent to normal logs.
         if (!detail.empty())
             msg += "\n" + QString::fromUtf8(detail.c_str());
         SetMsg(msg);
-    }
-
-    bool ApplyTikTokServiceSettings(const std::string &server, const std::string &key)
-    {
-        if (!output_)
-            return false;
-        OBSServiceAutoRelease service = obs_output_get_service(output_);
-        if (!service)
-            return false;
-        OBSDataAutoRelease settings = obs_service_get_settings(service);
-        if (!settings)
-            return false;
-        obs_data_set_string(settings, "server", server.c_str());
-        obs_data_set_string(settings, "key", key.c_str());
-        obs_service_update(service, settings);
-        return true;
     }
 
     // Ends a LIVE exactly once via a managed cleanup job. liveCounted
@@ -336,9 +327,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         if (!GlobalCleanupLedger().claim(streamId))
             return;
         auto runEnd = [client, streamId, liveCounted]() {
+            TikTokNetworkCancel cleanupScope(nullptr);
             std::string error;
             if (!client->EndStream(streamId, &error))
-                blog(LOG_WARNING, TAG "Failed to end TikTok LIVE session: %s", error.c_str());
+                blog(LOG_WARNING, TAG "[TikTokStream] Failed to end remote endpoint");
             else
                 blog(LOG_INFO, TAG "TikTok LIVE session ended.");
             if (liveCounted)
@@ -355,39 +347,60 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         }
     }
 
-    // Starts async TikTok LIVE preparation. Returns false on synchronous
-    // failure (caller aborts the start); on true the start continues in
-    // OnTikTokPrepared. Must run after all local OBS preparation so a
-    // local failure never leaves an orphaned LIVE.
-    bool BeginTikTokPrepare()
+    bool CreateTikTokEndpoint()
     {
+        if (endpointCreationUncertain_) {
+            startRestreamWhenReady_ = false;
+            SetMsg(obs_module_text("TikTok.CreationUncertain"));
+            return false;
+        }
+        if (tiktokSession_.HasEndpoint() ||
+            tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
+            tiktokSession_.state == TikTokSessionState::EndingEndpoint ||
+            tiktokSession_.state == TikTokSessionState::Authenticating)
+            return false;
         if (config_->protocol != "RTMP") {
             SetMsg(obs_module_text("Error.TikTokRequiresRTMP"));
             return false;
         }
-
         auto client = TikTokAuthManager::instance().client();
-        if (!client) {
-            SetMsg(obs_module_text("TikTok.SessionExpired"));
+        if (!client || !TikTokAuthManager::instance().isAuthenticated()) {
+            tiktokSession_.state = TikTokSessionState::Authenticating;
+            SetMsg(obs_module_text("TikTok.LoggingIn"));
+            TikTokAuthManager::instance().login(this);
             return false;
         }
+        return BeginEndpointRequest(std::move(client));
+    }
 
+    bool BeginEndpointRequest(std::shared_ptr<StreamlabsTikTokClient> client)
+    {
+        if (tiktokSession_.HasEndpoint() ||
+            tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
+            tiktokSession_.state == TikTokSessionState::EndingEndpoint)
+            return false;
         const std::string title = config_->tiktok.title;
         const std::string category = config_->tiktok.category;
         const TikTokAudience audience = config_->tiktok.audience;
         struct Prepared {
             TikTokCategoryResult category;
             TikTokStartResult start;
+            std::shared_ptr<StreamlabsTikTokClient> client;
+            bool adopted = false;
+            ~Prepared()
+            {
+                // Covers destruction/shutdown after Work finishes but
+                // before the queued Done callback adopts the endpoint.
+                if (start.success && !adopted)
+                    SubmitTikTokCleanup(client, start.streamId, false);
+            }
         };
         auto outcome = std::make_shared<Prepared>();
-        uint64_t gen = 0;
-        {
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            gen = ++tiktokRequestGen_;
-            tiktokState_ = TikTokRuntimeState::Preparing;
-        }
+        outcome->client = client;
+        const auto gen = ++tiktokRequestGen_;
+        tiktokSession_.state = TikTokSessionState::CreatingEndpoint;
         SetMsg(obs_module_text("TikTok.Preparing"));
-        blog(LOG_INFO, TAG "TikTok LIVE preparation started for '%s'.", config_->name.c_str());
+        blog(LOG_INFO, TAG "[TikTokStream] Creating remote endpoint");
 
         // Managed job: no raw this crosses threads. If the widget dies,
         // the worker finishes safely and ends any LIVE it created; the
@@ -400,16 +413,6 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                     outcome->start =
                         client->StartStream(title, outcome->category.categoryId, audience);
                 }
-                if (job->orphaned.load(std::memory_order_relaxed) && outcome->start.success &&
-                    GlobalCleanupLedger().claim(outcome->start.streamId)) {
-                    std::string error;
-                    if (!client->EndStream(outcome->start.streamId, &error)) {
-                        blog(LOG_WARNING, TAG "Failed to end orphaned TikTok LIVE session: %s",
-                             error.c_str());
-                    } else {
-                        blog(LOG_INFO, TAG "Orphaned TikTok LIVE session ended.");
-                    }
-                }
             },
             [client, outcome, gen](const std::shared_ptr<TikTokJobContext> &job) {
                 // dynamic_cast: QObject is a virtual base of QWidget, so
@@ -417,49 +420,36 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 auto *self = dynamic_cast<PushWidgetImpl *>(job->receiver.data());
                 if (self == nullptr)
                     return;
+                outcome->adopted = true;
                 self->OnTikTokPrepared(gen, client, outcome->category, outcome->start);
             },
             true);
         if (!job) {
             blog(LOG_WARNING, TAG "TikTok preparation rejected during shutdown for '%s'.",
                  config_->name.c_str());
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            tiktokState_ = TikTokRuntimeState::Idle;
+            tiktokSession_.state = TikTokSessionState::Error;
+            startRestreamWhenReady_ = false;
             return false;
         }
         return true;
     }
 
-    // UI-thread continuation of BeginTikTokPrepare.
+    // UI-thread continuation of endpoint creation.
     void OnTikTokPrepared(uint64_t gen, std::shared_ptr<StreamlabsTikTokClient> client,
                           const TikTokCategoryResult &categoryResult, const TikTokStartResult &startResult)
     {
-        {
-            std::unique_lock<std::mutex> lock(tiktokMutex_);
-            if (gen != tiktokRequestGen_ || tiktokState_ != TikTokRuntimeState::Preparing) {
-                // Cancelled while preparing (or superseded): a LIVE created
-                // by the stale worker must still be ended exactly once.
-                // Unlock first so cleanup submission never runs under the
-                // state lock.
-                std::shared_ptr<StreamlabsTikTokClient> staleClient;
-                std::string staleStreamId;
-                if (startResult.success) {
-                    staleClient = client;
-                    staleStreamId = startResult.streamId;
-                }
-                if (tiktokState_ == TikTokRuntimeState::Cancelling)
-                    tiktokState_ = TikTokRuntimeState::Idle;
-                lock.unlock();
-                if (staleClient)
-                    SubmitTikTokCleanup(staleClient, staleStreamId, false);
-                return;
-            }
+        if (gen != tiktokRequestGen_ ||
+            tiktokSession_.state != TikTokSessionState::CreatingEndpoint) {
+            if (startResult.success)
+                SubmitTikTokCleanup(client, startResult.streamId, false);
+            return;
         }
 
         if (!categoryResult.success) {
             {
-                std::lock_guard<std::mutex> lock(tiktokMutex_);
-                tiktokState_ = TikTokRuntimeState::Idle;
+                tiktokSession_.state = TikTokSessionState::Error;
+                startRestreamWhenReady_ = false;
+                endAfterStop_ = false;
             }
             switch (ClassifyCredentialResult(categoryResult)) {
             case CredentialValidation::InvalidCredential:
@@ -481,8 +471,9 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 
         if (!startResult.success) {
             {
-                std::lock_guard<std::mutex> lock(tiktokMutex_);
-                tiktokState_ = TikTokRuntimeState::Idle;
+                tiktokSession_.state = TikTokSessionState::Error;
+                startRestreamWhenReady_ = false;
+                endAfterStop_ = false;
             }
             switch (ClassifyCredentialResult(startResult)) {
             case CredentialValidation::InvalidCredential:
@@ -494,103 +485,120 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             default:
                 break;
             }
+            endpointCreationUncertain_ = startResult.failure == TikTokFailure::Network ||
+                startResult.failure == TikTokFailure::Timeout || startResult.failure == TikTokFailure::Server ||
+                startResult.failure == TikTokFailure::InvalidResponse;
             blog(LOG_WARNING, TAG "TikTok LIVE creation failed for '%s'.", config_->name.c_str());
             ShowTikTokError(TikTokFailureText(startResult.failure, false), startResult.error);
+            if (endpointCreationUncertain_) SetMsg(obs_module_text("TikTok.CreationUncertain"));
             return;
         }
 
-        // Generated credentials are session-only: they update the live
-        // service, never the saved config.
-        if (!ApplyTikTokServiceSettings(startResult.server, startResult.key)) {
-            {
-                std::lock_guard<std::mutex> lock(tiktokMutex_);
-                tiktokState_ = TikTokRuntimeState::Idle;
-            }
-            SubmitTikTokCleanup(client, startResult.streamId, false);
-            SetMsg(obs_module_text("Error.CreateRtmpService"));
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            tiktokState_ = TikTokRuntimeState::LiveCreated;
-            tiktokStreamId_ = startResult.streamId;
-            tiktokClient_ = client;
-            TikTokLiveRegistry::addLive();
-        }
-        // Creating the LIVE proves eligibility even when /info never
-        // said so; hides the Apply button from here on.
+        tiktokSession_.streamId = startResult.streamId;
+        tiktokSession_.server = startResult.server;
+        tiktokSession_.streamKey = startResult.key;
+        tiktokSession_.client = client;
+        tiktokSession_.state = TikTokSessionState::EndpointReady;
+        TikTokLiveRegistry::addLive();
         TikTokAuthManager::instance().noteLiveStartSucceeded(client->authEpoch());
-        blog(LOG_INFO, TAG "TikTok LIVE session created for '%s'.", config_->name.c_str());
-
-        if (!obs_output_start(output_)) {
-            CleanupTikTokLive();
-            SetMsg(obs_module_text("Error.StartOutput"));
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            if (tiktokState_ == TikTokRuntimeState::LiveCreated)
-                tiktokState_ = TikTokRuntimeState::Streaming;
+        blog(LOG_INFO, TAG "[TikTokStream] Endpoint created");
+        SetMsg(obs_module_text("TikTok.EndpointReady"));
+        if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); return; }
+        if (startRestreamWhenReady_) {
+            startRestreamWhenReady_ = false;
+            StartRestream();
         }
     }
 
-    // Requests cancellation of an in-flight preparation. The worker is
-    // left running: its completion finds a stale generation and ends any
-    // LIVE it managed to create. Activity stays registered (via the
-    // worker service) until that worker actually finishes.
-    void CancelTikTokPrepare()
+    void EndTikTokEndpoint()
     {
-        std::lock_guard<std::mutex> lock(tiktokMutex_);
-        if (tiktokState_ != TikTokRuntimeState::Preparing)
+        startRestreamWhenReady_ = false;
+        if (restreamState_ != RestreamState::Stopped || IsRunning()) {
+            endAfterStop_ = true;
+            StopRestream();
             return;
+        }
+        if (tiktokSession_.state == TikTokSessionState::EndingEndpoint)
+            return;
+        if (tiktokSession_.state == TikTokSessionState::CreatingEndpoint) {
+            // Retain the generation until completion; end the resulting endpoint.
+            endAfterStop_ = true;
+            return;
+        }
+        if (!tiktokSession_.HasEndpoint()) {
+            if (endpointCreationUncertain_) {
+                // There is no stream id to end or query. Let the user
+                // resolve the uncertain creation on TikTok before retrying.
+                const auto answer = QMessageBox::question(this,
+                    obs_module_text("TikTok.EndLive"), obs_module_text("TikTok.ResolveUncertain"));
+                if (answer != QMessageBox::Yes) return;
+                endpointCreationUncertain_ = false;
+            }
+            tiktokSession_.Reset();
+            SetMsg(obs_module_text("TikTok.EndpointEnded"));
+            return;
+        }
+        tiktokSession_.state = TikTokSessionState::EndingEndpoint;
+        SetMsg(obs_module_text("TikTok.EndingEndpoint"));
+        blog(LOG_INFO, TAG "[TikTokStream] Ending remote endpoint");
+        const auto gen = ++tiktokRequestGen_;
+        auto client = tiktokSession_.client;
+        auto id = tiktokSession_.streamId;
+        struct EndOutcome {
+            bool success = false;
+            TikTokFailure failure = TikTokFailure::None;
+            bool retained = false;
+            ~EndOutcome() {
+                // If the owner disappears, no retry is possible. Keep
+                // registry accounting balanced after the final attempt.
+                if (!success && !retained) TikTokLiveRegistry::removeLive();
+            }
+        };
+        auto outcome = std::make_shared<EndOutcome>();
+        auto job = TikTokWorkerService::instance().submit(this,
+            [client, id, outcome](const std::shared_ptr<TikTokJobContext> &) {
+                outcome->success = client->EndStream(id, nullptr, &outcome->failure);
+                // A missing remote stream no longer owns a reusable endpoint.
+                if (outcome->failure == TikTokFailure::NotFound) outcome->success = true;
+                if (outcome->success) TikTokLiveRegistry::removeLive();
+                else blog(LOG_WARNING, TAG "[TikTokStream] Remote end failed; retry available while owner exists");
+            },
+            [gen, client, outcome](const std::shared_ptr<TikTokJobContext> &job) {
+                auto *self = dynamic_cast<PushWidgetImpl *>(job->receiver.data());
+                if (!self || gen != self->tiktokRequestGen_) return;
+                if (outcome->success) {
+                    self->tiktokSession_.Reset();
+                    self->SetMsg(obs_module_text("TikTok.EndpointEnded"));
+                    blog(LOG_INFO, TAG "[TikTokStream] Remote endpoint ended");
+                } else {
+                    outcome->retained = true;
+                    self->tiktokSession_.state = outcome->failure == TikTokFailure::Auth ?
+                        TikTokSessionState::Error : TikTokSessionState::EndpointReady;
+                    if (outcome->failure == TikTokFailure::Auth)
+                        TikTokAuthManager::instance().handleAuthFailure(client->authEpoch());
+                    self->SetMsg(obs_module_text("Error.TikTokEndLive"));
+                }
+            }, true, true);
+        if (!job) {
+            outcome->retained = true;
+            tiktokSession_.state = TikTokSessionState::EndpointReady;
+            SetMsg(obs_module_text("Error.TikTokEndLive"));
+        }
+    }
+
+    void ShutdownTikTokIntegration()
+    {
         ++tiktokRequestGen_;
-        tiktokState_ = TikTokRuntimeState::Cancelling;
-    }
-
-    // Ends the TikTok LIVE session if one is active. Idempotent and safe to
-    // call from every stop path (UI thread or output signal threads).
-    // Returns false only when a synchronous signal-thread end fails; the
-    // UI-thread path always hands the request to a managed cleanup job and
-    // returns true, so stopping never blocks the UI.
-    bool CleanupTikTokLive()
-    {
-        std::shared_ptr<StreamlabsTikTokClient> client;
-        std::string streamId;
-        {
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            if (tiktokState_ != TikTokRuntimeState::LiveCreated &&
-                tiktokState_ != TikTokRuntimeState::Streaming &&
-                tiktokState_ != TikTokRuntimeState::Stopping)
-                return true;
-            tiktokState_ = TikTokRuntimeState::Idle;
-            client = std::move(tiktokClient_);
-            streamId = std::move(tiktokStreamId_);
-            tiktokClient_.reset();
-            tiktokStreamId_.clear();
-        }
-        // State is cleared before the request so concurrent stop paths can
-        // never double-end the same session; the ledger serializes the
-        // racing UI/signal paths on top.
-        if (!client || streamId.empty())
-            return true;
-        QCoreApplication *app = QCoreApplication::instance();
-        const bool onMainThread = app != nullptr && QThread::currentThread() == app->thread();
-        if (onMainThread) {
-            SubmitTikTokCleanup(client, streamId, true);
-            return true;
-        }
-        if (!GlobalCleanupLedger().claim(streamId))
-            return true;
-        std::string error;
-        const bool ok = client->EndStream(streamId, &error);
-        TikTokLiveRegistry::removeLive();
-        if (!ok) {
-            blog(LOG_WARNING, TAG "Failed to end TikTok LIVE session: %s", error.c_str());
-            return false;
-        }
-        blog(LOG_INFO, TAG "TikTok LIVE session ended.");
-        return true;
+        startRestreamWhenReady_ = false;
+        endAfterStop_ = false;
+        endpointCreationUncertain_ = false;
+        TikTokWorkerService::instance().cancelReceiver(this);
+        ReleaseObsOutput();
+        if (tiktokSession_.HasEndpoint() &&
+            tiktokSession_.state != TikTokSessionState::EndingEndpoint)
+            SubmitTikTokCleanup(tiktokSession_.client, tiktokSession_.streamId, true);
+        tiktokSession_.Reset();
+        QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
     }
 
     std::string VideoEncoderName() {
@@ -794,11 +802,16 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     }
 
 
-    bool ReleaseOutput()
+    bool ReleaseObsOutput()
     {
-        CancelTikTokPrepare();
-        CleanupTikTokLive();
-
+        ++outputGeneration_;
+        restreamState_ = RestreamState::Stopped;
+        if (timer_) timer_->stop();
+        if (btn_) {
+            btn_->setText(obs_module_text("Btn.Start"));
+            btn_->setEnabled(true);
+        }
+        if (remove_btn_) remove_btn_->setEnabled(true);
         if (output_) {
             DisconnectSignals(output_);
         }
@@ -924,7 +937,36 @@ public:
 
         layout->addWidget(msg_ = new QLabel(u8"", this), 2, 0, 1, 3);
         msg_->setWordWrap(true);
-        layout->addItem(new QSpacerItem(0, 10), 3, 0);
+        create_live_btn_ = new QPushButton(obs_module_text("TikTok.CreateEndpoint"), this);
+        end_live_btn_ = new QPushButton(obs_module_text("TikTok.EndLive"), this);
+        layout->addWidget(create_live_btn_, 3, 0, 1, 2);
+        layout->addWidget(end_live_btn_, 3, 2);
+        QObject::connect(create_live_btn_, &QPushButton::clicked, this, [this]() { CreateTikTokEndpoint(); });
+        QObject::connect(end_live_btn_, &QPushButton::clicked, this, [this]() { EndTikTokEndpoint(); });
+        auto &auth = TikTokAuthManager::instance();
+        QObject::connect(&auth, &TikTokAuthManager::stateChanged, this, [this]() {
+            if (tiktokSession_.HasEndpoint() &&
+                tiktokSession_.state != TikTokSessionState::EndingEndpoint &&
+                TikTokAuthManager::instance().status() == TikTokAuthManager::Status::SessionExpired) {
+                tiktokSession_.state = TikTokSessionState::Error;
+                StopRestream();
+                SetMsg(obs_module_text("TikTok.SessionExpired"));
+            }
+        });
+        QObject::connect(&auth, &TikTokAuthManager::loginSucceeded, this, [this]() {
+            if (tiktokSession_.state == TikTokSessionState::Authenticating) {
+                tiktokSession_.state = TikTokSessionState::Idle;
+                CreateTikTokEndpoint();
+            }
+        });
+        QObject::connect(&auth, &TikTokAuthManager::loginFailed, this, [this](const QString &error) {
+            if (tiktokSession_.state == TikTokSessionState::Authenticating) {
+                tiktokSession_.state = TikTokSessionState::Error;
+                startRestreamWhenReady_ = false;
+                SetMsg(error);
+            }
+        });
+        layout->addItem(new QSpacerItem(0, 10), 4, 0);
         setLayout(layout);
 
         LoadConfig();
@@ -934,18 +976,62 @@ public:
     {
         // Orphan in-flight jobs before teardown: their completions are
         // dropped while their workers finish safely on pool threads.
-        TikTokWorkerService::instance().cancelReceiver(this);
-        ReleaseOutput();
+        ShutdownTikTokIntegration();
     }
 
-
     void StartStreaming() override {
+        if (endAfterStop_ || restreamState_ != RestreamState::Stopped || IsRunning()) return;
+        if (config_->tiktok.enabled && !tiktokSession_.HasEndpoint()) {
+            startRestreamWhenReady_ = true;
+            CreateTikTokEndpoint();
+            return;
+        }
+        StartRestream();
+    }
+
+    void StartRestream() {
         if (IsRunning())
             return;
 
-        // recreate output
-        ReleaseOutput();
+        if (restreamState_ != RestreamState::Stopped) return;
+        if (config_->tiktok.enabled && (!tiktokSession_.HasEndpoint() ||
+            tiktokSession_.state != TikTokSessionState::EndpointReady)) return;
+        ReleaseObsOutput();
+        restreamState_ = RestreamState::Preparing;
+        if (config_->tiktok.enabled) SetMsg(obs_module_text("TikTok.StartingRestream"));
+        if (config_->tiktok.enabled)
+            blog(LOG_INFO, TAG "[TikTokStream] OBS output preparation started");
 
+        if (!CreateObsOutput()) {
+            RestreamFailed("Error.StartOutput");
+            return;
+        }
+
+        if (!PrepareOutputService(tiktokSession_.server, tiktokSession_.streamKey))
+        {
+            RestreamFailed("Error.CreateRtmpService");
+            return;
+        }
+
+        if (!PrepareOutputEncoders())
+        {
+            RestreamFailed("Error.CreateEncoder");
+            return;
+        }
+
+        if (!PrepareEncoderSource())
+        {
+            RestreamFailed("Error.SceneNotExist");
+            return;
+        }
+
+        restreamState_ = RestreamState::Connecting;
+        if (!obs_output_start(output_))
+            RestreamFailed("Error.StartOutput");
+    }
+
+    bool CreateObsOutput()
+    {
         if (output_ == nullptr)
         {
             obs_data* output_settings = obs_data_create_from_json(config_->outputParam.dump().c_str());
@@ -961,6 +1047,10 @@ public:
             blog(LOG_DEBUG, "Streaming to output: %s", output_id);
 
             output_ = obs_output_create(output_id, "multi-output", output_settings, nullptr);
+            obs_data_release(output_settings);
+            if (!output_) {
+                return false;
+            }
             SetMeAsHandler(output_);
         }
 
@@ -982,87 +1072,62 @@ public:
             }
         }
 
-        if (!PrepareOutputService())
-        {
-            SetMsg(obs_module_text("Error.CreateRtmpService"));
-            return;
-        }
-
-        if (!PrepareOutputEncoders())
-        {
-            SetMsg(obs_module_text("Error.CreateEncoder"));
-            return;
-        }
-
-        if (!PrepareEncoderSource())
-        {
-            SetMsg(obs_module_text("Error.SceneNotExist"));
-            return;
-        }
-
-        if (config_->tiktok.enabled) {
-            // Async path: OnTikTokPrepared() finishes the start once the
-            // LIVE session exists. A synchronous failure aborts here.
-            BeginTikTokPrepare();
-            return;
-        }
-
-        if (!obs_output_start(output_)) {
-            SetMsg(obs_module_text("Error.StartOutput"));
-        }
+        return output_ != nullptr;
     }
 
-    void StopStreaming() override {
+    void RestreamFailed(const char *message)
+    {
+        ReleaseObsOutput();
+        if (tiktokSession_.HasEndpoint())
+            blog(LOG_WARNING, TAG "[TikTokStream] Local failure (%s); endpoint preserved", message);
+        SetMsg(QString::fromUtf8(obs_module_text(message)) +
+               (tiktokSession_.HasEndpoint() ? "\n" + QString::fromUtf8(obs_module_text("TikTok.EndpointReady")) : QString()));
+    }
+
+    void StopStreaming() override { StopRestream(); }
+
+    void StopRestream()
+    {
+        startRestreamWhenReady_ = false;
         if (!IsRunning()) {
-            // Covers Stop pressed while PreparingTikTok: the pending
-            // request is cancelled and the output never starts.
-            CancelTikTokPrepare();
-            CleanupTikTokLive();
-            SetMsg(u8"");
+            ReleaseObsOutput();
+            if (tiktokSession_.HasEndpoint())
+                SetMsg(obs_module_text(tiktokSession_.state == TikTokSessionState::Error ?
+                    "TikTok.SessionExpired" : "TikTok.RestreamStopped"));
+            if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); }
             return;
         }
-
+        if (restreamState_ == RestreamState::Stopping) return;
         bool useForce = false;
         if (isUseDelay_) {
-            auto res = QMessageBox(QMessageBox::Icon::Information,
-                "?",
+            const auto res = QMessageBox(QMessageBox::Icon::Information, "?",
                 obs_module_text("Ques.DropDelay"),
-                QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No,
-                this
-            ).exec();
-            if (res == QMessageBox::Yes)
-                useForce = true;
+                QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No, this).exec();
+            useForce = res == QMessageBox::Yes;
         }
-
-        {
-            std::lock_guard<std::mutex> lock(tiktokMutex_);
-            if (tiktokState_ == TikTokRuntimeState::Streaming ||
-                tiktokState_ == TikTokRuntimeState::LiveCreated)
-                tiktokState_ = TikTokRuntimeState::Stopping;
-        }
-        if (!useForce)
-            obs_output_stop(output_);
-        else
-            obs_output_force_stop(output_);
-
-        // No TikTok cleanup here: OnStopped() ends the session once the
-        // output has actually stopped (see CleanupTikTokLive).
+        // A delayed output can finish while the confirmation dialog is open.
+        if (!IsRunning()) { StopRestream(); return; }
+        restreamState_ = RestreamState::Stopping;
+        if (useForce) obs_output_force_stop(output_);
+        else obs_output_stop(output_);
     }
-   
+
     void OnOBSEvent(obs_frontend_event ev) override
     {
         if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_EXIT
             || ev == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED
-            || ev == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED
         ) {
             Stop();
+        } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED) {
+            StopRestream();
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTING) {
             if (!IsRunning() && config_->syncStart) {
                 StartStop();
             }
         } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
-            if (IsRunning() && config_->syncStop) {
-                StartStop();
+            if (config_->syncStop && (IsRunning() || restreamState_ != RestreamState::Stopped ||
+                                      startRestreamWhenReady_)) {
+                StopStreaming();
             }
         }
     }
@@ -1070,6 +1135,9 @@ public:
     void LoadConfig()
     {
         name_->setText(QString::fromUtf8(config_->name));
+        create_live_btn_->setVisible(config_->tiktok.enabled);
+        end_live_btn_->setVisible(config_->tiktok.enabled);
+        UpdateTikTokActions();
     }
 
     void ResetInfo()
@@ -1087,7 +1155,7 @@ public:
 
     void StartStop()
     {
-        if (IsRunning())
+        if (IsRunning() || restreamState_ != RestreamState::Stopped)
         {
             StopStreaming();
             return;
@@ -1096,15 +1164,7 @@ public:
         StartStreaming();
     }
 
-    void Stop()
-    {
-        if (IsRunning())
-        {
-            obs_output_force_stop(output_);
-        }
-        CancelTikTokPrepare();
-        CleanupTikTokLive();
-    }
+    void Stop() { ShutdownTikTokIntegration(); }
 
     bool ShowEditDlg() override
     {
@@ -1112,6 +1172,7 @@ public:
 
         if (dlg->exec() == QDialog::DialogCode::Accepted)
         {
+            if (!config_->tiktok.enabled && tiktokSession_.HasEndpoint()) EndTikTokEndpoint();
             SaveMultiOutputConfig();
             LoadConfig();
             return true;
@@ -1122,14 +1183,39 @@ public:
 
     void SetMsg(QString msg)
     {
+        UpdateTikTokActions();
         msg_->setText(msg);
         msg_->setToolTip(msg);
+    }
+
+    void UpdateTikTokActions()
+    {
+        if (!create_live_btn_ || !config_->tiktok.enabled) return;
+        const auto state = tiktokSession_.state;
+        const bool busy = state == TikTokSessionState::Authenticating ||
+            state == TikTokSessionState::CreatingEndpoint || state == TikTokSessionState::EndingEndpoint;
+        edit_btn_->setEnabled(!busy);
+        create_live_btn_->setEnabled(!busy && !tiktokSession_.HasEndpoint() && !endpointCreationUncertain_);
+        end_live_btn_->setEnabled(state != TikTokSessionState::EndingEndpoint &&
+            (tiktokSession_.HasEndpoint() || state == TikTokSessionState::CreatingEndpoint || endpointCreationUncertain_));
+        btn_->setEnabled(!busy);
+    }
+
+    void QueueOutputUI(std::function<void()> callback)
+    {
+        QPointer<QObject> receiver(this);
+        const auto generation = outputGeneration_.load();
+        QMetaObject::invokeMethod(this, [receiver, generation, callback = std::move(callback)]() {
+            auto *self = dynamic_cast<PushWidgetImpl *>(receiver.data());
+            if (self && generation == self->outputGeneration_.load()) callback();
+        }, Qt::QueuedConnection);
     }
 
     // obs logical
     void OnStarting() override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        QueueOutputUI([this]() {
+            restreamState_ = RestreamState::Connecting;
             begin_time_ = clock::now();
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
@@ -1141,12 +1227,14 @@ public:
 
     void OnStarted() override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        QueueOutputUI([this]() {
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Streaming"));
 
+            restreamState_ = RestreamState::Streaming;
+            if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
             ResetInfo();
             timer_->start();
         });
@@ -1154,7 +1242,7 @@ public:
 
     void OnReconnect() override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        QueueOutputUI([this]() {
             timer_->stop();
 
             remove_btn_->setEnabled(false);
@@ -1166,12 +1254,14 @@ public:
 
     void OnReconnected() override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        QueueOutputUI([this]() {
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Streaming"));
 
+            restreamState_ = RestreamState::Streaming;
+            if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
             ResetInfo();
             timer_->start();
         });
@@ -1179,7 +1269,7 @@ public:
 
     void OnStopping() override
     {
-        GetGlobalService().RunInUIThread([this]() {
+        QueueOutputUI([this]() {
             timer_->stop();
 
             remove_btn_->setEnabled(false);
@@ -1191,13 +1281,10 @@ public:
 
     void OnStopped(int code) override
     {
-        // Ends the TikTok session once the output has actually stopped, so a
-        // graceful (possibly delayed) stop keeps receiving until the end.
-        // This also covers fatal output failures; user/shutdown stop paths
-        // call CleanupTikTokLive() directly as well (it is idempotent).
-        const bool tiktokEnded = CleanupTikTokLive();
-
-        GetGlobalService().RunInUIThread([this, code, tiktokEnded]() {
+        QueueOutputUI([this, code]() {
+            ReleaseObsOutput();
+            if (tiktokSession_.HasEndpoint())
+                blog(LOG_INFO, TAG "[TikTokStream] OBS output stopped; endpoint preserved");
             ResetInfo();
             timer_->stop();
 
@@ -1209,10 +1296,8 @@ public:
             switch(code)
             {
                 case 0:
-                    if (!tiktokEnded)
-                        SetMsg(obs_module_text("Error.TikTokEndLive"));
-                    else
-                        SetMsg(u8"");
+                    if (tiktokSession_.HasEndpoint())
+                        SetMsg(obs_module_text("TikTok.RestreamStopped"));
                     break;
                 case -1:
                     SetMsg(obs_module_text("Error.WrongRTMPUrl"));
@@ -1230,10 +1315,12 @@ public:
                     SetMsg(obs_module_text("Error.Unknown"));
                     break;
             }
+            if (code != 0 && tiktokSession_.state == TikTokSessionState::EndpointReady)
+                SetMsg(msg_->text() + "\n" + QString::fromUtf8(obs_module_text("TikTok.EndpointReady")));
+            if (tiktokSession_.state == TikTokSessionState::Error)
+                SetMsg(obs_module_text("TikTok.SessionExpired"));
+            if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); }
         });
-
-        ReleaseOutputEncoder();
-        ReleaseOutputSceneView();
     }
 };
 

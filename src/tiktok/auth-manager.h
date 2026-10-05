@@ -15,7 +15,9 @@
 // guarded by attempt/generation ids so stale callbacks do nothing.
 
 #include <QObject>
+#include <QPointer>
 #include <QString>
+#include <QUrl>
 
 #include <chrono>
 #include <cstdint>
@@ -197,10 +199,14 @@ private:
     bool loginActive_ = false;
     bool reauthing_ = false;
     std::unique_ptr<TikTokAuthFlow> flow_;
-    TikTokAuthDialog *dialog_ = nullptr;
-    TikTokAuthDialog *applyDialog_ = nullptr;
+    QPointer<TikTokAuthDialog> dialog_;
+    QPointer<TikTokAuthDialog> applyDialog_;
+    QTimer *authUrlPollTimer_ = nullptr;
+    QUrl lastPolledUrl_;
+    bool authUrlPollInProgress_ = false;
     QTimer *pollTimer_ = nullptr;
     QTimer *exchangeTimeout_ = nullptr;
     QTimer *overallTimeout_ = nullptr;
     QTimer *refreshTimer_ = nullptr;
+    QObject *deferredContext_ = nullptr; // cancels one-shot continuations on unload
 };
