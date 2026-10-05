@@ -1019,7 +1019,10 @@ void TikTokAuthManager::validateCandidateOnWorker(uint64_t attempt, std::string 
             StreamlabsTikTokClient probe(candidateToken);
             *validation = probe.GetAccountInfo();
         },
-        [this, attempt, candidateToken = std::move(candidateToken), validation, isReauth](
+        // Both submit arguments capture the token by value. Moving it in
+        // either argument can empty the other capture: argument evaluation
+        // order is unspecified.
+        [this, attempt, candidateToken, validation, isReauth](
             const std::shared_ptr<TikTokJobContext> &) {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1045,6 +1048,8 @@ void TikTokAuthManager::validateCandidateOnWorker(uint64_t attempt, std::string 
                 break;
             }
             QString message;
+            blog(LOG_WARNING, TAG "[TikTokAuth] Token validation failed (failure=%d)",
+                 static_cast<int>(validation->failure));
             if (validation->failure == TikTokFailure::Network ||
                 validation->failure == TikTokFailure::Timeout) {
                 message = QString::fromUtf8(obs_module_text("Error.TikTokNetwork"));
