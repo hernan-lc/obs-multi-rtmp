@@ -197,6 +197,72 @@ struct TikTokLifecycleTest {
         CHECK(widget->create_live_btn_->isHidden());
         widget.reset(); config->tiktok.enabled = true;
 
+        // Standalone-encoder preflight: an explicitly selected custom
+        // config id that is missing is an actionable error, never a silent
+        // fallback to the shared OBS encoder, and the saved selection is
+        // left untouched for the user to fix.
+        widget = std::make_unique<PushWidgetImpl>("test", nullptr);
+        config->videoConfig = "no-such-video-config";
+        config->audioConfig = "no-such-audio-config";
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.MissingVideoConfig");
+        CHECK(config->videoConfig == "no-such-video-config");
+        CHECK(!widget->GetAudioEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.MissingAudioConfig");
+        CHECK(config->audioConfig == "no-such-audio-config");
+
+        // Invalid resolution, FPS divisor, and mixer index fail the same
+        // way instead of starting a misconfigured output.
+        auto badVideo = std::make_shared<VideoEncoderConfig>();
+        badVideo->id = "bad-video"; badVideo->encoderId = "obs_x264";
+        badVideo->resolution = "not-a-resolution"; badVideo->fpsDenumerator = 1;
+        GlobalMultiOutputConfig().videoConfig.push_back(badVideo);
+        config->videoConfig = "bad-video";
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidVideoConfig");
+        badVideo->resolution.reset(); badVideo->fpsDenumerator = 0;
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidVideoConfig");
+        auto badAudio = std::make_shared<AudioEncoderConfig>();
+        badAudio->id = "bad-audio"; badAudio->encoderId = "ffmpeg_aac";
+        badAudio->mixerId = 99;
+        GlobalMultiOutputConfig().audioConfig.push_back(badAudio);
+        config->audioConfig = "bad-audio";
+        CHECK(!widget->GetAudioEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidAudioConfig");
+        config->videoConfig.reset(); config->audioConfig.reset();
+
+        // A disabled target refuses Start without any remote call, and a
+        // failed local start releases the starting guard so the next
+        // Start is not blocked.
+        config->enabled = false;
+        widget->StartStreaming();
+        CHECK(starts == beforeRetry);
+        CHECK(widget->restreamState_ == Local::Stopped);
+        config->enabled = true;
+        config->tiktok.enabled = false;
+        widget->StartStreaming();
+        CHECK(!widget->isStarting_);
+        CHECK(widget->restreamState_ == Local::Stopped);
+        CHECK(starts == beforeRetry && ends == 7);
+        config->tiktok.enabled = true;
+        widget.reset();
+
+        // Export roundtrip keeps TikTok settings but never credentials;
+        // malformed input yields nullopt instead of wiping targets.
+        config->tiktok.title = "QA Title";
+        const std::string exported = SerializeMultiOutputConfig(GlobalMultiOutputConfig());
+        CHECK(exported.find("QA Title") != std::string::npos);
+        CHECK(exported.find("token") == std::string::npos);
+        CHECK(exported.find("FAKE-KEY") == std::string::npos);
+        CHECK(DeserializeMultiOutputConfig(exported).has_value());
+        CHECK(!DeserializeMultiOutputConfig("{not json").has_value());
+
         // Owner disappears after worker completion, before UI adoption.
         startFinished = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
