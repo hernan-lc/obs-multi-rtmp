@@ -82,11 +82,57 @@ an account and verifies:
 - Stale output events are ignored; destruction before/after worker completion is safe.
 - End during creation; failed End after owner destruction balances activity tracking.
 - Shutdown discards queued completion and cleans up an unadopted endpoint.
+- Missing/invalid saved video/audio encoder configs fail with a specific
+  error key and leave the saved selection untouched (no silent fallback to
+  the shared OBS encoder).
+- Disabled targets refuse Start without any remote call; a failed local
+  start releases the starting guard so the next Start is not blocked.
+- Config export roundtrip keeps TikTok settings but never credentials;
+  malformed import input yields nullopt instead of wiping targets.
+- Strict import shape validation: `{}`, foreign objects, non-array
+  targets, id-less or wrongly-typed entries are rejected; current targets
+  survive every rejection.
+- Starting-guard regression for the exact disable-during-creation sequence;
+  preflight blocks automatic endpoint creation on a missing scene while the
+  manual Create path still works; preflight legs verified directly.
+- `test-tiktok-standalone` (real OBS video 720p30 + audio 44.1 kHz, real
+  plugins, needs a display for GL; without one it exits 77, reported by
+  CTest as Skipped — never as Passed):
+  independent x264+AAC start, flow frames, stop, same-endpoint restart and
+  encoder reuse with no `/stream/start` call and no main streaming output;
+  real `rtmp_output` against a closed localhost port maps stop code -2
+  (ServerConnect) with a message and preserves the endpoint; owner teardown
+  ends every adopted session exactly once with a balanced registry and no
+  leaked services/encoders in the shutdown log.
+- VAAPI datum (AMD BC-250, this machine): `ffmpeg_vaapi` enumerates and
+  `obs_video_encoder_create("ffmpeg_vaapi")` succeeds. VAAPI *streaming*
+  (not just creation) remains untested.
 
 The optional Node test executes the generated exchange script, checking the
 expected-document fence, in-flight fetch guard, retained settled result and fresh
 document retry. Existing response, auth-flow, PKCE, credential-store, auth-URL,
 exchange and cleanup tests remain enabled.
+
+## Results split: automated / manual / not run
+
+Automated (run in this branch; see commands above): all 9 ctest suites pass,
+including the extended `test-tiktok-lifecycle` checks listed above, on Linux
+with system libobs 30 / Qt 6.12 (repo targets OBS 32.2.1; API used here is
+stable across both).
+
+Manual (requires a real OBS install and, where noted, a TikTok account):
+scenarios 1-12 below plus shared-encoder, extra-audio-track, delayed-stop,
+custom-scene and YouTube/Twitch/Kick/custom-RTMP checks on a real install.
+
+Not run: TikTok-authenticated LIVE (no account in this environment), real
+RTMP handshake bytes (no RTMP peer here; covered via refused-connection
+mapping), VAAPI/NVENC streaming runs (creation proven for VAAPI, streaming
+not attempted), Windows/macOS builds and packaged-WebEngine login (need
+their CI/platform environments). Note: repo CI previously triggered only
+on tags/`workflow_dispatch`; `push.yaml` now also triggers on pull
+requests to master/main, so this PR should gain build checks once
+reviewed on GitHub. Until those are green, results above are from local
+runs quoted verbatim.
 
 ## Live manual validation still required
 
@@ -107,6 +153,8 @@ account or broadcast a LIVE. The following are pending, not claimed as passed:
 | 10. Cancel/close login | Timers stop; stale token callbacks cannot accept a credential |
 | 11. Close OBS during creation | Safe shutdown; any known created endpoint is ended |
 | 12. Rapid Start clicks | One remote creation and one local start |
+| 13. Fresh OBS, primary Start Streaming never pressed, new TikTok target with independent H.264+AAC | Create endpoint + Start works; OBS streaming stays inactive; repeated stop/start reuses the endpoint; local Stop never calls `/stream/end`. Encoder/output half automated by `test-tiktok-standalone`; real RTMP bytes + authenticated LIVE still manual |
+| 14. Disabled target + Start All / hotkeys / sync start | Disabled target is skipped; disabling a live target stops local output only, endpoint stays consistent |
 
 Also verify shared video/audio encoders, additional audio tracks, delayed stop,
 custom scenes, and YouTube/Twitch/Kick/custom RTMP on a real OBS installation.

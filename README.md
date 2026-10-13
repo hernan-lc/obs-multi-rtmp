@@ -58,8 +58,10 @@ Please refer to obs-plugintemplate to understand how it works.
 Any output target can optionally stream to TikTok LIVE. When enabled, the
 plugin calls the Streamlabs API to create a TikTok LIVE session, receives a
 fresh RTMP server/key pair, and streams to it with the normal OBS output.
-Stopping the target (or closing OBS / switching profiles) ends the TikTok
-LIVE session again.
+The remote LIVE endpoint and the local RTMP output have separate lifecycles:
+stopping the local output (or a failed start) preserves a ready endpoint for
+retry, while "End TikTok LIVE", target deletion, profile switches away from
+its profile, and OBS exit end the remote session.
 
 TikTok stream access is controlled by TikTok/Streamlabs account eligibility.
 This plugin does not grant LIVE permission to an account.
@@ -72,7 +74,30 @@ This plugin does not grant LIVE permission to an account.
 4. Sign into TikTok in the secure login window.
 5. Authorize the Streamlabs integration.
 6. When the plugin shows "Connected as @username", configure title/category.
-7. Start the output normally.
+7. Use "Create TikTok Endpoint" to prepare the LIVE without starting the
+   output, then Start the output normally (Start creates the endpoint first
+   when none exists yet).
+
+### Encoders: independent vs shared
+
+A brand-new TikTok target defaults to independent H.264 video + AAC audio
+encoders (software x264/AAC baseline when available), so it can stream
+without starting OBS's primary streaming or recording output. Existing
+targets keep whatever encoder choice they already saved.
+
+In the target settings, each track shows either its sharing partners or a
+dependency warning:
+
+- "Shares the OBS streaming encoder: requires OBS Start Streaming to be
+  active." — starting this target while OBS is not streaming fails with an
+  actionable message instead of starting OBS for you.
+- "Shares the OBS recording encoder: ..." — same for recording.
+
+To go independent, open Modify and pick a concrete encoder (e.g. x264 for
+video, FFmpeg AAC for audio) for each track independently. If a saved
+encoder choice is missing or invalid when you press Start, the target
+reports exactly which track is broken instead of silently using another
+encoder.
 
 No Streamlabs token, RTMP server, stream key, or authorization code ever
 needs to be copied or pasted: the plugin obtains and stores the OAuth
@@ -130,5 +155,23 @@ fuzzy-matches an unrelated game. Category suggestions appear as you type.
 - "The embedded TikTok login browser (Qt WebEngine) is not available in
   this build.": the package lacks the Qt WebEngine runtime; use a build
   with WebEngine support.
-- The TikTok LIVE session is always ended when the output stops, including
-  forced stops, failed starts, OBS shutdown and profile switches.
+- "The shared OBS encoder is unavailable. ...": the target shares OBS's
+  streaming (or recording) encoder but that OBS output is not running.
+  Either start the corresponding OBS output first, or open Modify and pick
+  independent encoders (recommended: x264 video + AAC audio).
+- "The saved video/audio encoder configuration is missing/invalid. ...":
+  open Modify and choose the encoder for the named track again. The plugin
+  never silently substitutes another encoder.
+- If the local output fails to start or drops, the message now includes the
+  underlying OBS/encoder error text when libobs reports one. A ready TikTok
+  endpoint is preserved across local failures and local Stop: press Start
+  again to retry on the same endpoint, or "End TikTok LIVE" to close it.
+  Only explicit End, target deletion, profile switches and OBS exit end the
+  remote session.
+- If the output cannot start with a hardware encoder (NVENC/VAAPI/AMF),
+  first verify the software baseline (x264 + AAC) starts: that separates a
+  driver/hardware problem from a configuration problem. Hardware encoders
+  are only usable where their drivers exist; their presence in the encoder
+  list does not guarantee initialization succeeds. Optional manual checks:
+  NVIDIA NVENC (e.g. RTX 3060, `nvidia-smi` must list the GPU) and AMD VAAPI
+  (e.g. BC-250, `vainfo` must list an H.264 encoder entry).

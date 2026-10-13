@@ -5,6 +5,10 @@
 #include <filesystem>
 #include <unordered_map>
 
+#include <QFileDialog>
+#include <QFile>
+#include <QIODevice>
+
 #include "push-widget.h"
 #include "plugin-support.h"
 
@@ -66,6 +70,7 @@ protected:
         case QEvent::PolishRequest:
         case QEvent::Show:
         case QEvent::StyleChange:
+            RefreshItemSizeHints();
             updateGeometry();
             break;
         default:
@@ -76,6 +81,16 @@ protected:
     }
 
 private:
+    void RefreshItemSizeHints()
+    {
+        for (int i = 0; i < count(); ++i) {
+            auto item = this->item(i);
+            auto widget = itemWidget(item);
+            if (item && widget)
+                item->setSizeHint(widget->sizeHint());
+        }
+    }
+
     int ContentHeight() const
     {
         auto *widget = const_cast<OutputsListWidget *>(this);
@@ -144,7 +159,7 @@ public:
             for (auto x : GetAllPushWidgets())
                 x->StopStreaming();
         });
- 
+
         // load and show outputs
         outputsContainer_ = new OutputsListWidget(container_);
         outputsContainer_->setDragDropMode(QAbstractItemView::InternalMove);
@@ -179,6 +194,21 @@ public:
             &MultiOutputWidget::OnOutputMoved
         );
         layout_->addWidget(outputsContainer_);
+
+        // export / import config, so a target list (including stream keys)
+        // can be backed up or moved to another profile/PC instead of only
+        // ever living inside the current profile's obs-multi-rtmp.json
+        auto ioBtnContainer = new QWidget(this);
+        auto ioBtnLayout = new QHBoxLayout();
+        auto exportButton = new QPushButton(obs_module_text("Btn.ExportConfig"), ioBtnContainer);
+        ioBtnLayout->addWidget(exportButton);
+        auto importButton = new QPushButton(obs_module_text("Btn.ImportConfig"), ioBtnContainer);
+        ioBtnLayout->addWidget(importButton);
+        ioBtnContainer->setLayout(ioBtnLayout);
+        layout_->addWidget(ioBtnContainer);
+
+        QObject::connect(exportButton, &QPushButton::clicked, this, &MultiOutputWidget::ExportConfig);
+        QObject::connect(importButton, &QPushButton::clicked, this, &MultiOutputWidget::ImportConfig);
 
         // donate
         if (std::string("\xe5\xa4\x9a\xe8\xb7\xaf\xe6\x8e\xa8\xe6\xb5\x81") == obs_module_text("Title"))
@@ -294,6 +324,114 @@ public:
     void SaveConfig()
     {
         SaveMultiOutputConfig();
+    }
+
+    void ExportConfig()
+    {
+        SaveConfig();
+
+        auto fileName = QFileDialog::getSaveFileName(
+            this,
+            obs_module_text("Btn.ExportConfig"),
+            "obs-multi-rtmp-config.json",
+            "JSON (*.json)"
+        );
+        if (fileName.isEmpty())
+            return;
+        if (!fileName.endsWith(".json", Qt::CaseInsensitive))
+            fileName += ".json";
+
+        // The backup contains plain RTMP servers/keys. TikTok OAuth tokens
+        // and generated LIVE credentials are never serialized, but ordinary
+        // custom stream keys are sensitive: confirm before writing.
+        auto confirmExport = QMessageBox(
+            QMessageBox::Icon::Warning,
+            obs_module_text("Question.Title"),
+            obs_module_text("Question.ExportSensitive"),
+            QMessageBox::Yes | QMessageBox::No,
+            this
+        ).exec();
+        if (confirmExport != QMessageBox::Yes)
+            return;
+
+        auto content = SerializeMultiOutputConfig(GlobalMultiOutputConfig());
+
+        QFile file(fileName);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            QMessageBox(
+                QMessageBox::Icon::Critical,
+                obs_module_text("Notice.Title"),
+                obs_module_text("Error.ExportConfig"),
+                QMessageBox::StandardButton::Ok,
+                this
+            ).exec();
+            return;
+        }
+        file.write(content.c_str(), static_cast<qint64>(content.size()));
+    }
+
+    void ImportConfig()
+    {
+        auto fileName = QFileDialog::getOpenFileName(
+            this,
+            obs_module_text("Btn.ImportConfig"),
+            QString(),
+            "JSON (*.json)"
+        );
+        if (fileName.isEmpty())
+            return;
+
+        QFile file(fileName);
+        if (!file.open(QIODevice::ReadOnly)) {
+            QMessageBox(
+                QMessageBox::Icon::Critical,
+                obs_module_text("Notice.Title"),
+                obs_module_text("Error.ImportConfig"),
+                QMessageBox::StandardButton::Ok,
+                this
+            ).exec();
+            return;
+        }
+        auto bytes = file.readAll();
+
+        auto imported = DeserializeMultiOutputConfig(std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
+        if (!imported.has_value()) {
+            QMessageBox(
+                QMessageBox::Icon::Critical,
+                obs_module_text("Notice.Title"),
+                obs_module_text("Error.ImportConfig"),
+                QMessageBox::StandardButton::Ok,
+                this
+            ).exec();
+            return;
+        }
+
+        for (auto x : GetAllPushWidgets()) {
+            if (x->IsRunning()) {
+                QMessageBox(
+                    QMessageBox::Icon::Warning,
+                    obs_module_text("Notice.Title"),
+                    obs_module_text("Error.ImportActive"),
+                    QMessageBox::StandardButton::Ok,
+                    this
+                ).exec();
+                return;
+            }
+        }
+
+        auto confirm = QMessageBox(
+            QMessageBox::Icon::Question,
+            obs_module_text("Question.Title"),
+            obs_module_text("Question.Import"),
+            QMessageBox::Yes | QMessageBox::No,
+            this
+        ).exec();
+        if (confirm != QMessageBox::Yes)
+            return;
+
+        GlobalMultiOutputConfig() = *imported;
+        SaveConfig();
+        LoadConfig();
     }
 
     void OnOutputMoved(
@@ -461,6 +599,31 @@ bool obs_module_load()
         delete dock;
         return false;
     }
+
+    obs_hotkey_register_frontend(
+        "obs-multi-rtmp.start_all",
+        obs_module_text("Hotkey.StartAllTargets"),
+        [](void* private_data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+            auto dock = static_cast<MultiOutputWidget*>(private_data);
+            if (!pressed || !dock)
+                return;
+            for (auto x : dock->GetAllPushWidgets())
+                x->StartStreaming();
+        },
+        dock
+    );
+    obs_hotkey_register_frontend(
+        "obs-multi-rtmp.stop_all",
+        obs_module_text("Hotkey.StopAllTargets"),
+        [](void* private_data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+            auto dock = static_cast<MultiOutputWidget*>(private_data);
+            if (!pressed || !dock)
+                return;
+            for (auto x : dock->GetAllPushWidgets())
+                x->StopStreaming();
+        },
+        dock
+    );
 
     blog(LOG_INFO, TAG "version: %s by SoraYuki https://github.com/sorayuki/obs-multi-rtmp/", PLUGIN_VERSION);
 

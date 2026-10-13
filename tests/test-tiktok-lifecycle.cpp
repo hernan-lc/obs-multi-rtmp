@@ -197,6 +197,198 @@ struct TikTokLifecycleTest {
         CHECK(widget->create_live_btn_->isHidden());
         widget.reset(); config->tiktok.enabled = true;
 
+        // Standalone-encoder preflight: an explicitly selected custom
+        // config id that is missing is an actionable error, never a silent
+        // fallback to the shared OBS encoder, and the saved selection is
+        // left untouched for the user to fix.
+        widget = std::make_unique<PushWidgetImpl>("test", nullptr);
+        config->videoConfig = "no-such-video-config";
+        config->audioConfig = "no-such-audio-config";
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.MissingVideoConfig");
+        CHECK(config->videoConfig == "no-such-video-config");
+        CHECK(!widget->GetAudioEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.MissingAudioConfig");
+        CHECK(config->audioConfig == "no-such-audio-config");
+
+        // Invalid resolution, FPS divisor, and mixer index fail the same
+        // way instead of starting a misconfigured output.
+        auto badVideo = std::make_shared<VideoEncoderConfig>();
+        badVideo->id = "bad-video"; badVideo->encoderId = "obs_x264";
+        badVideo->resolution = "not-a-resolution"; badVideo->fpsDenumerator = 1;
+        GlobalMultiOutputConfig().videoConfig.push_back(badVideo);
+        config->videoConfig = "bad-video";
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidVideoConfig");
+        badVideo->resolution.reset(); badVideo->fpsDenumerator = 0;
+        CHECK(!widget->GetVideoEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidVideoConfig");
+        auto badAudio = std::make_shared<AudioEncoderConfig>();
+        badAudio->id = "bad-audio"; badAudio->encoderId = "ffmpeg_aac";
+        badAudio->mixerId = 99;
+        GlobalMultiOutputConfig().audioConfig.push_back(badAudio);
+        config->audioConfig = "bad-audio";
+        CHECK(!widget->GetAudioEncoder().Get());
+        CHECK(std::string(widget->lastEncoderError_ ? widget->lastEncoderError_ : "")
+              == "Error.InvalidAudioConfig");
+        config->videoConfig.reset(); config->audioConfig.reset();
+
+        // A disabled target refuses Start without any remote call, and a
+        // failed local start releases the starting guard so the next
+        // Start is not blocked.
+        config->enabled = false;
+        widget->StartStreaming();
+        CHECK(starts == beforeRetry);
+        CHECK(widget->restreamState_ == Local::Stopped);
+        config->enabled = true;
+        config->tiktok.enabled = false;
+        widget->StartStreaming();
+        CHECK(!widget->isStarting_);
+        CHECK(widget->restreamState_ == Local::Stopped);
+        CHECK(starts == beforeRetry && ends == 7);
+        config->tiktok.enabled = true;
+        widget.reset();
+
+        // Export roundtrip keeps TikTok settings but never credentials;
+        // malformed input yields nullopt instead of wiping targets.
+        config->tiktok.title = "QA Title";
+        const std::string exported = SerializeMultiOutputConfig(GlobalMultiOutputConfig());
+        CHECK(exported.find("QA Title") != std::string::npos);
+        CHECK(exported.find("token") == std::string::npos);
+        CHECK(exported.find("FAKE-KEY") == std::string::npos);
+        CHECK(DeserializeMultiOutputConfig(exported).has_value());
+        CHECK(!DeserializeMultiOutputConfig("{not json").has_value());
+
+        // Strict import validation: valid JSON with a foreign shape must be
+        // rejected, never applied as an empty configuration. The current
+        // targets must survive every rejection below.
+        const size_t targetsBefore = GlobalMultiOutputConfig().targets.size();
+        CHECK(!DeserializeMultiOutputConfig("{}").has_value());
+        CHECK(!DeserializeMultiOutputConfig("{\"hello\":\"world\"}").has_value());
+        CHECK(!DeserializeMultiOutputConfig("[]").has_value());
+        CHECK(!DeserializeMultiOutputConfig("{\"targets\":{}}").has_value());
+        CHECK(!DeserializeMultiOutputConfig("{\"targets\":[{\"name\":\"x\"}]}").has_value());
+        CHECK(!DeserializeMultiOutputConfig("{\"targets\":[{\"id\":42}]}").has_value());
+        CHECK(!DeserializeMultiOutputConfig("{\"targets\":[],\"video_configs\":{}}").has_value());
+        CHECK(!DeserializeMultiOutputConfig(
+            "{\"targets\":[{\"id\":\"a\"}],\"video_configs\":[{}]}").has_value());
+        CHECK(DeserializeMultiOutputConfig(
+            "{\"targets\":[{\"id\":\"a\"}],\"video_configs\":[{\"id\":\"v\"}],\"audio_configs\":[]}").has_value());
+        CHECK(GlobalMultiOutputConfig().targets.size() == targetsBefore);
+
+        // P0 guard regression, exact reported sequence: Start arms the
+        // guard and defers on endpoint creation; disabling cancels the
+        // deferred start; the orphaned creation finishes with no local
+        // continuation; re-enabling must allow a new Start.
+        widget = std::make_unique<PushWidgetImpl>("test", nullptr);
+        widget->isStarting_ = true;
+        widget->startRestreamWhenReady_ = true;
+        holdStart = true; startEntered = false;
+        CHECK(widget->BeginEndpointRequest(client));
+        widget->SetEnabled(false);
+        CHECK(!widget->startRestreamWhenReady_);
+        holdStart = false;
+        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        QCoreApplication::processEvents();
+        CHECK(!widget->isStarting_);
+        CHECK(widget->tiktokSession_.HasEndpoint());
+        widget->SetEnabled(true);
+        const int startsBeforeGuard = starts.load();
+        const int attemptsBeforeGuard = outputAttempts;
+        widget->StartStreaming();
+        QCoreApplication::processEvents();
+        // The compare_exchange accepted the Start (a stuck guard would have
+        // refused before any local work): the local stage ran and failed on
+        // the fault-injected output, releasing the guard again.
+        CHECK(outputAttempts == attemptsBeforeGuard + 1);
+        CHECK(!widget->isStarting_);
+        CHECK(widget->restreamState_ == Local::Stopped);
+        CHECK(starts.load() == startsBeforeGuard);
+        widget->EndTikTokEndpoint();
+        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        widget.reset();
+
+        // Preflight blocks automatic endpoint creation on a broken local
+        // configuration (here: a scene that does not exist), while the
+        // manual Create path stays available.
+        widget = std::make_unique<PushWidgetImpl>("test", nullptr);
+        auto sceneVideo = std::make_shared<VideoEncoderConfig>();
+        sceneVideo->id = "v-scene"; sceneVideo->encoderId = "obs_x264";
+        sceneVideo->outputScene = "no-such-scene";
+        GlobalMultiOutputConfig().videoConfig.push_back(sceneVideo);
+        config->videoConfig = "v-scene";
+        config->audioConfig.reset();
+        const int startsBeforePreflight = starts.load();
+        widget->StartStreaming();
+        QCoreApplication::processEvents();
+        CHECK(starts.load() == startsBeforePreflight);
+        CHECK(!widget->tiktokSession_.HasEndpoint());
+        CHECK(widget->tiktokSession_.state == Remote::Idle);
+        CHECK(!widget->isStarting_);
+        // ...but an explicit endpoint request still works without encoders.
+        CHECK(widget->BeginEndpointRequest(client));
+        CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
+        widget->EndTikTokEndpoint();
+        CHECK(wait([&] { return widget->tiktokSession_.state == Remote::Idle; }));
+        config->videoConfig.reset();
+        widget.reset();
+
+        // Preflight legs, called directly: default shared selections report
+        // the unavailable shared encoder headlessly, and valid independent
+        // configs pass every creation-free leg (the codec leg then stops at
+        // the fault-injected output allocation, which the real-OBS
+        // standalone test covers end to end). Stub encoder types stand in
+        // for real plugin registrations (none load in this harness) so the
+        // registration gate can be told apart from genuinely unknown IDs.
+        auto stubName = [](void *) -> const char * { return "stub"; };
+        auto stubCreate = [](obs_data_t *, obs_encoder_t *) -> void * { return nullptr; };
+        auto stubDestroy = [](void *) {};
+        auto stubEncode = [](void *, struct encoder_frame *,
+                             struct encoder_packet *, bool *) { return false; };
+        auto stubFrameSize = [](void *) -> size_t { return 0; };
+        struct obs_encoder_info stubVideo = {};
+        stubVideo.id = "stub_h264"; stubVideo.type = OBS_ENCODER_VIDEO;
+        stubVideo.codec = "h264";
+        stubVideo.get_name = stubName; stubVideo.create = stubCreate;
+        stubVideo.destroy = stubDestroy; stubVideo.encode = stubEncode;
+        obs_register_encoder(&stubVideo);
+        struct obs_encoder_info stubAudio = {};
+        stubAudio.id = "stub_aac"; stubAudio.type = OBS_ENCODER_AUDIO;
+        stubAudio.codec = "aac";
+        stubAudio.get_name = stubName; stubAudio.create = stubCreate;
+        stubAudio.destroy = stubDestroy; stubAudio.encode = stubEncode;
+        stubAudio.get_frame_size = stubFrameSize;
+        obs_register_encoder(&stubAudio);
+        widget = std::make_unique<PushWidgetImpl>("test", nullptr);
+        config->videoConfig.reset(); config->audioConfig.reset();
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.SharedEncoderUnavailable");
+        auto goodVideo = std::make_shared<VideoEncoderConfig>();
+        goodVideo->id = "v-good"; goodVideo->encoderId = "stub_h264";
+        GlobalMultiOutputConfig().videoConfig.push_back(goodVideo);
+        auto goodAudio = std::make_shared<AudioEncoderConfig>();
+        goodAudio->id = "a-good"; goodAudio->encoderId = "stub_aac";
+        GlobalMultiOutputConfig().audioConfig.push_back(goodAudio);
+        config->videoConfig = "v-good"; config->audioConfig = "a-good";
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.StartOutput");
+        // Unregistered encoder IDs fail before any output allocation or
+        // remote creation: libobs reports a null codec for them.
+        goodVideo->encoderId = "nonexistent_h264_encoder";
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.CreateEncoder");
+        goodVideo->encoderId = "stub_h264";
+        goodAudio->encoderId = "nonexistent_aac_encoder";
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.CreateEncoder");
+        goodAudio->encoderId = "stub_aac";
+        config->videoConfig.reset(); config->audioConfig.reset();
+        widget.reset();
+
         // Owner disappears after worker completion, before UI adoption.
         startFinished = false;
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
@@ -208,7 +400,9 @@ struct TikTokLifecycleTest {
             QThread::msleep(1);
         CHECK(!TikTokWorkerService::instance().hasActiveActivity());
         widget.reset();
-        CHECK(wait([] { return ends.load() == 8; }));
+        // (+2 remote Ends consumed by the guard-regression and preflight
+        // blocks above.)
+        CHECK(wait([] { return ends.load() == 10; }));
         CHECK(wait([] { return !TikTokLiveRegistry::hasActiveActivity(); }));
 
         // Explicit End failure after owner destruction balances the registry.
@@ -217,7 +411,7 @@ struct TikTokLifecycleTest {
         CHECK(wait([&] { return widget->tiktokSession_.HasEndpoint(); }));
         failEnd = true;
         widget->EndTikTokEndpoint(); widget.reset();
-        CHECK(wait([] { return ends.load() == 9; }));
+        CHECK(wait([] { return ends.load() == 11; }));
         CHECK(wait([] { return !TikTokLiveRegistry::hasActiveActivity(); }));
         failEnd = false;
 
@@ -230,7 +424,7 @@ struct TikTokLifecycleTest {
         while (!startFinished && timeout.elapsed() < 5000) QThread::msleep(1);
         CHECK(startFinished);
         TikTokWorkerService::instance().shutdown();
-        CHECK(ends == 10);
+        CHECK(ends == 12);
         widget.reset();
         CHECK(!TikTokLiveRegistry::hasActiveActivity());
         return true;
