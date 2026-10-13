@@ -180,12 +180,13 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             blog(LOG_ERROR, TAG "Prepare output service before output object is created.");
             return false;
         }
-        
-        // Refuse to replace the service of an active output: the setter
-        // would silently ignore the new service while the old reference
-        // below is dropped.
-        if (!ReleaseOutputService())
+
+        // Never replace the service of a live output: the setter would
+        // silently ignore the new service.
+        if (obs_output_active(output_)) {
+            blog(LOG_ERROR, TAG "Prepare output service while output is active.");
             return false;
+        }
 
         OBSDataAutoRelease conf = obs_data_create_from_json(config_->serviceParam.dump().c_str());
         if (conf && config_->tiktok.enabled) {
@@ -203,11 +204,19 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
 
         if (!conf)
             return false;
-        
+
+        // Build the replacement BEFORE touching the previous service: if
+        // creation fails, the old service stays owned and valid instead of
+        // leaving the output pointed at freed memory. The setter takes no
+        // reference and merely borrows, so the old creation reference is
+        // dropped only after the replacement is installed.
         auto service = obs_service_create(service_id, "multi-output-service", conf, nullptr);
         if (!service)
             return false;
+        auto previous = obs_output_get_service(output_); // borrowed
         obs_output_set_service(output_, service);
+        if (previous && previous != service)
+            obs_service_release(previous);
         if (obs_output_get_service(output_) != service) {
             // The output did not take ownership (it does not use
             // services, e.g. file/muxer outputs): drop our creation
@@ -216,30 +225,6 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             obs_service_release(service);
         }
 
-        return true;
-    }
-
-
-    bool ReleaseOutputService()
-    {
-        if (!output_)
-            return true;
-
-        if (obs_output_active(output_)) {
-            return false;
-        }
-
-        // obs_output_get_service() returns a borrowed pointer, and the
-        // setter takes no reference and ignores null, so dropping our
-        // creation reference is the whole job. The caller must not destroy
-        // the output afterwards while it still points at a freed service:
-        // see ReleaseObsOutput(). Replacing the service of an active
-        // output is refused: the setter would silently ignore it.
-        if (obs_output_active(output_))
-            return false;
-        auto service = obs_output_get_service(output_);
-        if (service)
-            obs_service_release(service);
         return true;
     }
 
@@ -1282,6 +1267,19 @@ public:
                 customAudioEncoder = audioConfig->encoderId;
             }
         }
+        // The encoder IDs must be registered at all: libobs reports a
+        // null codec for unknown IDs, and an unregistered encoder could
+        // otherwise pass every check above, mint a remote LIVE, and only
+        // fail when the real encoder is created afterwards.
+        const char* videoCodec =
+            customVideoId.empty() ? "" : obs_get_encoder_codec(customVideoId.c_str());
+        const char* audioCodec = customAudioEncoder.empty()
+                                     ? ""
+                                     : obs_get_encoder_codec(customAudioEncoder.c_str());
+        if (!customVideoId.empty() && (!videoCodec || !*videoCodec))
+            return "Error.CreateEncoder";
+        if (!customAudioEncoder.empty() && (!audioCodec || !*audioCodec))
+            return "Error.CreateEncoder";
         // Codec support of the chosen independent encoders against the
         // output. Placeholders were checked for availability above.
         if (!customVideoId.empty() || !customAudioEncoder.empty()) {
@@ -1289,12 +1287,10 @@ public:
                 return "Error.StartOutput";
             auto cleanup = finally([this] { ReleaseObsOutput(); });
             if (!customVideoId.empty() &&
-                !CodecInList(obs_output_get_supported_video_codecs(output_),
-                             obs_get_encoder_codec(customVideoId.c_str())))
+                !CodecInList(obs_output_get_supported_video_codecs(output_), videoCodec))
                 return "Error.UnsupportedVideoCodec";
             if (!customAudioEncoder.empty() &&
-                !CodecInList(obs_output_get_supported_audio_codecs(output_),
-                             obs_get_encoder_codec(customAudioEncoder.c_str())))
+                !CodecInList(obs_output_get_supported_audio_codecs(output_), audioCodec))
                 return "Error.UnsupportedAudioCodec";
         }
         return nullptr;

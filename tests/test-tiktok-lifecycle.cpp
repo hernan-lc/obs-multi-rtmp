@@ -341,20 +341,51 @@ struct TikTokLifecycleTest {
         // the unavailable shared encoder headlessly, and valid independent
         // configs pass every creation-free leg (the codec leg then stops at
         // the fault-injected output allocation, which the real-OBS
-        // standalone test covers end to end).
+        // standalone test covers end to end). Stub encoder types stand in
+        // for real plugin registrations (none load in this harness) so the
+        // registration gate can be told apart from genuinely unknown IDs.
+        auto stubName = [](void *) -> const char * { return "stub"; };
+        auto stubCreate = [](obs_data_t *, obs_encoder_t *) -> void * { return nullptr; };
+        auto stubDestroy = [](void *) {};
+        auto stubEncode = [](void *, struct encoder_frame *,
+                             struct encoder_packet *, bool *) { return false; };
+        auto stubFrameSize = [](void *) -> size_t { return 0; };
+        struct obs_encoder_info stubVideo = {};
+        stubVideo.id = "stub_h264"; stubVideo.type = OBS_ENCODER_VIDEO;
+        stubVideo.codec = "h264";
+        stubVideo.get_name = stubName; stubVideo.create = stubCreate;
+        stubVideo.destroy = stubDestroy; stubVideo.encode = stubEncode;
+        obs_register_encoder(&stubVideo);
+        struct obs_encoder_info stubAudio = {};
+        stubAudio.id = "stub_aac"; stubAudio.type = OBS_ENCODER_AUDIO;
+        stubAudio.codec = "aac";
+        stubAudio.get_name = stubName; stubAudio.create = stubCreate;
+        stubAudio.destroy = stubDestroy; stubAudio.encode = stubEncode;
+        stubAudio.get_frame_size = stubFrameSize;
+        obs_register_encoder(&stubAudio);
         widget = std::make_unique<PushWidgetImpl>("test", nullptr);
         config->videoConfig.reset(); config->audioConfig.reset();
         CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
               == "Error.SharedEncoderUnavailable");
         auto goodVideo = std::make_shared<VideoEncoderConfig>();
-        goodVideo->id = "v-good"; goodVideo->encoderId = "obs_x264";
+        goodVideo->id = "v-good"; goodVideo->encoderId = "stub_h264";
         GlobalMultiOutputConfig().videoConfig.push_back(goodVideo);
         auto goodAudio = std::make_shared<AudioEncoderConfig>();
-        goodAudio->id = "a-good"; goodAudio->encoderId = "ffmpeg_aac";
+        goodAudio->id = "a-good"; goodAudio->encoderId = "stub_aac";
         GlobalMultiOutputConfig().audioConfig.push_back(goodAudio);
         config->videoConfig = "v-good"; config->audioConfig = "a-good";
         CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
               == "Error.StartOutput");
+        // Unregistered encoder IDs fail before any output allocation or
+        // remote creation: libobs reports a null codec for them.
+        goodVideo->encoderId = "nonexistent_h264_encoder";
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.CreateEncoder");
+        goodVideo->encoderId = "stub_h264";
+        goodAudio->encoderId = "nonexistent_aac_encoder";
+        CHECK(std::string(widget->ValidateLocalEncoderConfiguration())
+              == "Error.CreateEncoder");
+        goodAudio->encoderId = "stub_aac";
         config->videoConfig.reset(); config->audioConfig.reset();
         widget.reset();
 
