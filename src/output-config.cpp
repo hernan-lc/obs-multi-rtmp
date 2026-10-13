@@ -298,10 +298,49 @@ std::string SerializeMultiOutputConfig(MultiOutputConfig& config) {
     return SaveMultiOutputConfig(config);
 }
 
+// Strict shape check for IMPORTED files only. The profile loader above
+// stays tolerant (old profiles must keep loading), but an import replaces
+// every current target, so a valid-JSON-but-foreign file such as
+// {"hello":"world"} must be rejected instead of wiping the configuration.
+// Required: top-level object, "targets" array, and a string "id" on every
+// target and encoder-config entry. Field-level types stay tolerant: the
+// loader coerces them to defaults.
+static bool ValidateImportedConfig(const nlohmann::json& doc) {
+    using nlohmann::json;
+    if (doc.type() != json::value_t::object)
+        return false;
+    auto targets = doc.find("targets");
+    if (targets == doc.end() || targets->type() != json::value_t::array)
+        return false;
+    auto validEntries = [](const json& list) {
+        for (auto& entry : list) {
+            if (entry.type() != json::value_t::object)
+                return false;
+            auto id = entry.find("id");
+            if (id == entry.end() || id->type() != json::value_t::string)
+                return false;
+        }
+        return true;
+    };
+    if (!validEntries(*targets))
+        return false;
+    for (auto key : {"video_configs", "audio_configs"}) {
+        auto it = doc.find(key);
+        if (it != doc.end()) {
+            if (it->type() != json::value_t::array || !validEntries(*it))
+                return false;
+        }
+    }
+    return true;
+}
+
 std::optional<MultiOutputConfig> DeserializeMultiOutputConfig(const std::string& content) {
     try {
         auto parsed = nlohmann::json::parse(content);
-        (void)parsed;
+        if (!ValidateImportedConfig(parsed)) {
+            blog(LOG_WARNING, TAG "Import rejected: valid JSON but not a target configuration");
+            return std::nullopt;
+        }
     } catch (const std::exception&) {
         return std::nullopt;
     }
