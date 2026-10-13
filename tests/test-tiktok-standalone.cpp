@@ -110,10 +110,17 @@ struct StandaloneTest {
         TikTokLiveRegistry::addLive();
     }
 
+    // Set when the environment cannot run the real pipeline (no video
+    // device, missing plugins/encoders). main() maps this to CTest's
+    // SKIP_RETURN_CODE so a skip is never reported as a pass.
+    static bool skipped;
+
     static bool run() {
         if (!loadPlugin("obs-outputs") || !loadPlugin("rtmp-services") ||
-            !loadPlugin("obs-x264") || !loadPlugin("obs-ffmpeg"))
+            !loadPlugin("obs-x264") || !loadPlugin("obs-ffmpeg")) {
+            skipped = true;
             return true; // SKIP printed above.
+        }
 
         struct obs_video_info ovi = {};
         ovi.adapter = 0;
@@ -125,6 +132,7 @@ struct StandaloneTest {
         ovi.colorspace = VIDEO_CS_SRGB;
         if (obs_reset_video(&ovi) != 0) {
             std::cout << "SKIP: obs_reset_video unavailable (no video device)\n";
+            skipped = true;
             return true;
         }
         struct obs_audio_info oai = {};
@@ -132,6 +140,7 @@ struct StandaloneTest {
         oai.speakers = SPEAKERS_STEREO;
         if (!obs_reset_audio(&oai)) {
             std::cout << "SKIP: obs_reset_audio unavailable\n";
+            skipped = true;
             return true;
         }
 
@@ -151,6 +160,7 @@ struct StandaloneTest {
                       << " vaapi=" << haveVaapi << "\n";
             if (!haveX264 || !haveAac) {
                 std::cout << "SKIP: software baseline encoders unavailable\n";
+                skipped = true;
                 return true;
             }
             if (haveVaapi) {
@@ -259,6 +269,8 @@ struct StandaloneTest {
     }
 };
 
+bool StandaloneTest::skipped = false;
+
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
     if (!obs_startup("en-US", nullptr, nullptr)) return 1;
@@ -266,6 +278,10 @@ int main(int argc, char **argv) {
     redirectRtmpToNull = true;
     TikTokAuthManager::instance().shutdown();
     obs_shutdown();
+    if (StandaloneTest::skipped) {
+        std::cout << "TikTok standalone checks SKIPPED (environment)\n";
+        return 77; // SKIP_RETURN_CODE: visible as skipped, never as passed.
+    }
     if (ok) std::cout << "TikTok standalone regression checks passed\n";
     return ok ? 0 : 1;
 }

@@ -96,7 +96,8 @@ an account and verifies:
   preflight blocks automatic endpoint creation on a missing scene while the
   manual Create path still works; preflight legs verified directly.
 - `test-tiktok-standalone` (real OBS video 720p30 + audio 44.1 kHz, real
-  plugins, needs a display for GL and skips cleanly without one):
+  plugins, needs a display for GL; without one it exits 77, reported by
+  CTest as Skipped — never as Passed):
   independent x264+AAC start, flow frames, stop, same-endpoint restart and
   encoder reuse with no `/stream/start` call and no main streaming output;
   real `rtmp_output` against a closed localhost port maps stop code -2
@@ -127,9 +128,11 @@ Not run: TikTok-authenticated LIVE (no account in this environment), real
 RTMP handshake bytes (no RTMP peer here; covered via refused-connection
 mapping), VAAPI/NVENC streaming runs (creation proven for VAAPI, streaming
 not attempted), Windows/macOS builds and packaged-WebEngine login (need
-their CI/platform environments). Note: repo CI workflows only trigger on
-tags/`workflow_dispatch`, so PR heads show no GitHub checks; results above
-are from local runs quoted verbatim.
+their CI/platform environments). Note: repo CI previously triggered only
+on tags/`workflow_dispatch`; `push.yaml` now also triggers on pull
+requests to master/main, so this PR should gain build checks once
+reviewed on GitHub. Until those are green, results above are from local
+runs quoted verbatim.
 
 ## Live manual validation still required
 
