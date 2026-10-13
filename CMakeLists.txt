@@ -214,4 +214,26 @@ if(BUILD_TESTING AND ENABLE_QT AND ENABLE_FRONTEND_API)
   set_target_properties(test-tiktok-lifecycle PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
   add_test(NAME tiktok-lifecycle COMMAND test-tiktok-lifecycle)
   set_tests_properties(tiktok-lifecycle PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+
+  # Real standalone-streaming integration: independent x264+AAC through the
+  # actual widget paths with real video/audio contexts and OBS plugins. No
+  # network, no account, and the main OBS streaming output is never
+  # started. Skips cleanly (exit 0 with a SKIP note) where video init is
+  # unavailable, e.g. display-less CI. Run with a display for GL:
+  # DISPLAY=:0 ctest -R tiktok-standalone
+  get_target_property(_standalone_sources ${CMAKE_PROJECT_NAME} SOURCES)
+  list(FILTER _standalone_sources EXCLUDE REGEX "push-widget\\.(cpp|h)$|streamlabs-client\\.cpp$")
+  add_executable(test-tiktok-standalone ./tests/test-tiktok-standalone.cpp ${_standalone_sources})
+  get_target_property(_standalone_includes ${CMAKE_PROJECT_NAME} INCLUDE_DIRECTORIES)
+  target_include_directories(test-tiktok-standalone PRIVATE ${_standalone_includes})
+  target_link_libraries(test-tiktok-standalone PRIVATE OBS::libobs OBS::obs-frontend-api
+    CURL::libcurl Qt6::Core Qt6::Widgets plugin-support)
+  if(WIN32)
+    target_link_libraries(test-tiktok-standalone PRIVATE Advapi32)
+  elseif(APPLE)
+    target_link_libraries(test-tiktok-standalone PRIVATE "-framework Security" "-framework CoreFoundation")
+  endif()
+  set_target_properties(test-tiktok-standalone PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
+  add_test(NAME tiktok-standalone COMMAND test-tiktok-standalone)
+  set_tests_properties(tiktok-standalone PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 180)
 endif()
