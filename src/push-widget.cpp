@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "helpers.h"
 #include <regex>
+#include <atomic>
 #include <optional>
 #include <tuple>
 #include <mutex>
@@ -112,6 +113,8 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     QPushButton* btn_ = 0;
     QLabel* name_ = 0;
     QLabel* msg_ = 0;
+    QLabel* status_dot_ = 0;
+    QCheckBox* enabled_cb_ = 0;
 
     using clock = std::chrono::steady_clock;
     clock::time_point begin_time_;
@@ -128,6 +131,17 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
     bool using_main_audio_encoder_ = false;
     obs_view_t* scene_view_ = 0;
     bool isUseDelay_ = false;
+    std::atomic_bool isStarting_ = false;
+
+    bool isConnecting_ = false;
+    bool isReconnecting_ = false;
+    int lastErrorCode_ = 0;
+
+    // Registered under the stable target id (not the display name) so key
+    // bindings survive renames. Their description label is set once at
+    // registration time and won't update if the target is renamed later.
+    obs_hotkey_id startHotkeyId_ = OBS_INVALID_HOTKEY_ID;
+    obs_hotkey_id stopHotkeyId_ = OBS_INVALID_HOTKEY_ID;
 
     // Remote resources are independent from the local OBS output. UI thread only.
     enum class TikTokSessionState { Idle, Authenticating, CreatingEndpoint,
@@ -450,6 +464,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 tiktokSession_.state = TikTokSessionState::Error;
                 startRestreamWhenReady_ = false;
                 endAfterStop_ = false;
+                isStarting_ = false;
             }
             switch (ClassifyCredentialResult(categoryResult)) {
             case CredentialValidation::InvalidCredential:
@@ -474,6 +489,7 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
                 tiktokSession_.state = TikTokSessionState::Error;
                 startRestreamWhenReady_ = false;
                 endAfterStop_ = false;
+                isStarting_ = false;
             }
             switch (ClassifyCredentialResult(startResult)) {
             case CredentialValidation::InvalidCredential:
@@ -903,6 +919,21 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         last_info_time_ = now;
     }
 
+    void UpdateStatusDot() {
+        if (!status_dot_)
+            return;
+
+        const char* color = "#888888"; // stopped / idle
+        if (isReconnecting_ || isConnecting_)
+            color = "#e6b800"; // connecting / reconnecting
+        else if (IsRunning())
+            color = "#2ecc71"; // live
+        else if (lastErrorCode_ != 0)
+            color = "#e74c3c"; // last attempt failed
+
+        status_dot_->setStyleSheet(QString("color: %1;").arg(color));
+    }
+
 public:
     PushWidgetImpl(const std::string& targetid, QWidget* parent = 0)
         : QWidget(parent)
@@ -922,20 +953,38 @@ public:
         });
 
         auto layout = new QGridLayout(this);
-        layout->addWidget(name_ = new QLabel(obs_module_text("NewStreaming"), this), 0, 0, 1, 3);
-        layout->addWidget(btn_ = new QPushButton(obs_module_text("Btn.Start"), this), 1, 0);
+        layout->addWidget(status_dot_ = new QLabel(u8"●", this), 0, 0);
+        layout->addWidget(name_ = new QLabel(obs_module_text("NewStreaming"), this), 0, 1, 1, 3);
+
+        layout->addWidget(enabled_cb_ = new QCheckBox(this), 1, 0);
+        enabled_cb_->setToolTip(obs_module_text("Target.Enabled"));
+        QObject::connect(enabled_cb_, &QCheckBox::clicked, [this](bool checked) {
+            SetEnabled(checked);
+        });
+
+        layout->addWidget(btn_ = new QPushButton(obs_module_text("Btn.Start"), this), 1, 1);
         QObject::connect(btn_, &QPushButton::clicked, [this]() {
             StartStop();
         });
 
-        layout->addWidget(edit_btn_ = new QPushButton(obs_module_text("Btn.Edit"), this), 1, 1);
+        layout->addWidget(edit_btn_ = new QPushButton(obs_module_text("Btn.Edit"), this), 1, 2);
         QObject::connect(edit_btn_, &QPushButton::clicked, [this]() {
             ShowEditDlg();
         });
 
-        layout->addWidget(remove_btn_ = new QPushButton(obs_module_text("Btn.Delete"), this), 1, 2);
+        layout->addWidget(remove_btn_ = new QPushButton(obs_module_text("Btn.Delete"), this), 1, 3);
 
-        layout->addWidget(msg_ = new QLabel(u8"", this), 2, 0, 1, 3);
+        // Keep action buttons usable in narrow docks across OBS themes.
+        for (auto button : { btn_, edit_btn_, remove_btn_ }) {
+            button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            button->setMinimumWidth(0);
+            button->setMinimumHeight(button->fontMetrics().height() + 8);
+        }
+        layout->setColumnStretch(1, 1);
+        layout->setColumnStretch(2, 1);
+        layout->setColumnStretch(3, 1);
+
+        layout->addWidget(msg_ = new QLabel(u8"", this), 2, 0, 1, 4);
         msg_->setWordWrap(true);
         create_live_btn_ = new QPushButton(obs_module_text("TikTok.CreateEndpoint"), this);
         end_live_btn_ = new QPushButton(obs_module_text("TikTok.EndLive"), this);
@@ -963,6 +1012,7 @@ public:
             if (tiktokSession_.state == TikTokSessionState::Authenticating) {
                 tiktokSession_.state = TikTokSessionState::Error;
                 startRestreamWhenReady_ = false;
+                isStarting_ = false;
                 SetMsg(error);
             }
         });
@@ -970,32 +1020,86 @@ public:
         setLayout(layout);
 
         LoadConfig();
+        UpdateStatusDot();
+
+        auto startDesc = std::string(obs_module_text("Hotkey.StartTarget")) + " - " + config_->name;
+        startHotkeyId_ = obs_hotkey_register_frontend(
+            ("obs-multi-rtmp.start." + targetid_).c_str(),
+            startDesc.c_str(),
+            [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+                if (!pressed)
+                    return;
+                static_cast<PushWidgetImpl*>(data)->StartStreaming();
+            },
+            this
+        );
+
+        auto stopDesc = std::string(obs_module_text("Hotkey.StopTarget")) + " - " + config_->name;
+        stopHotkeyId_ = obs_hotkey_register_frontend(
+            ("obs-multi-rtmp.stop." + targetid_).c_str(),
+            stopDesc.c_str(),
+            [](void* data, obs_hotkey_id, obs_hotkey_t*, bool pressed) {
+                if (!pressed)
+                    return;
+                static_cast<PushWidgetImpl*>(data)->StopStreaming();
+            },
+            this
+        );
     }
-    
+
     ~PushWidgetImpl()
     {
         // Orphan in-flight jobs before teardown: their completions are
         // dropped while their workers finish safely on pool threads.
+        // ReleaseObsOutput() runs inside ShutdownTikTokIntegration().
         ShutdownTikTokIntegration();
+        if (startHotkeyId_ != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_unregister(startHotkeyId_);
+        if (stopHotkeyId_ != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_unregister(stopHotkeyId_);
     }
 
     void StartStreaming() override {
-        if (endAfterStop_ || restreamState_ != RestreamState::Stopped || IsRunning()) return;
+        if (!config_->enabled) {
+            SetMsg(obs_module_text("Status.Disabled"));
+            return;
+        }
+        // Re-entry guard (upstream crash fix): StartStreaming() re-entry
+        // during connection used to crash. The flag stays set across the
+        // async TikTok endpoint creation below; terminal states (OnStarted,
+        // OnStopped, endpoint/auth failure, RestreamFailed) clear it.
+        bool expected = false;
+        if (IsRunning() || !isStarting_.compare_exchange_strong(expected, true))
+            return;
+        auto resetStarting = finally([this] { isStarting_ = false; });
+
+        if (endAfterStop_ || restreamState_ != RestreamState::Stopped) return;
         if (config_->tiktok.enabled && !tiktokSession_.HasEndpoint()) {
             startRestreamWhenReady_ = true;
             CreateTikTokEndpoint();
+            // Keep the guard only while async work is actually in flight
+            // (endpoint creation or login); otherwise release it.
+            if (tiktokSession_.state == TikTokSessionState::CreatingEndpoint ||
+                tiktokSession_.state == TikTokSessionState::Authenticating)
+                resetStarting.Dismiss();
+            else
+                startRestreamWhenReady_ = false;
             return;
         }
-        StartRestream();
+        if (StartRestream())
+            resetStarting.Dismiss();
     }
 
-    void StartRestream() {
+    // Returns true when an async OBS start is in flight (OnStarted/
+    // OnStopped will clear the starting guard); false otherwise.
+    bool StartRestream() {
+        auto clearStarting = finally([this] { isStarting_ = false; });
         if (IsRunning())
-            return;
+            return false;
 
-        if (restreamState_ != RestreamState::Stopped) return;
+        if (restreamState_ != RestreamState::Stopped) return false;
         if (config_->tiktok.enabled && (!tiktokSession_.HasEndpoint() ||
-            tiktokSession_.state != TikTokSessionState::EndpointReady)) return;
+            tiktokSession_.state != TikTokSessionState::EndpointReady)) return false;
         ReleaseObsOutput();
         restreamState_ = RestreamState::Preparing;
         if (config_->tiktok.enabled) SetMsg(obs_module_text("TikTok.StartingRestream"));
@@ -1004,30 +1108,36 @@ public:
 
         if (!CreateObsOutput()) {
             RestreamFailed("Error.StartOutput");
-            return;
+            return false;
         }
 
         if (!PrepareOutputService(tiktokSession_.server, tiktokSession_.streamKey))
         {
             RestreamFailed("Error.CreateRtmpService");
-            return;
+            return false;
         }
 
         if (!PrepareOutputEncoders())
         {
             RestreamFailed("Error.CreateEncoder");
-            return;
+            return false;
         }
 
         if (!PrepareEncoderSource())
         {
             RestreamFailed("Error.SceneNotExist");
-            return;
+            return false;
         }
 
         restreamState_ = RestreamState::Connecting;
-        if (!obs_output_start(output_))
+        if (!obs_output_start(output_)) {
             RestreamFailed("Error.StartOutput");
+            return false;
+        }
+        // obs_output_start() is asynchronous: keep the starting guard set
+        // until OnStarted()/OnStopped() clears it.
+        clearStarting.Dismiss();
+        return true;
     }
 
     bool CreateObsOutput()
@@ -1089,6 +1199,10 @@ public:
     void StopRestream()
     {
         startRestreamWhenReady_ = false;
+        // A deferred start (endpoint creation/login in flight) is cancelled
+        // here; release the starting guard so a later Start can proceed.
+        // An already-created endpoint is preserved (see OnTikTokPrepared).
+        isStarting_ = false;
         if (!IsRunning()) {
             ReleaseObsOutput();
             if (tiktokSession_.HasEndpoint())
@@ -1138,6 +1252,8 @@ public:
         create_live_btn_->setVisible(config_->tiktok.enabled);
         end_live_btn_->setVisible(config_->tiktok.enabled);
         UpdateTikTokActions();
+        if (enabled_cb_)
+            enabled_cb_->setChecked(config_->enabled);
     }
 
     void ResetInfo()
@@ -1148,9 +1264,26 @@ public:
         msg_->setText("");
     }
 
-    bool IsRunning()
+    bool IsRunning() override
     {
-        return output_ != nullptr && obs_output_active(output_); 
+        return output_ != nullptr && obs_output_active(output_);
+    }
+
+    bool GetEnabled() override { return config_->enabled; }
+
+    void SetEnabled(bool enabled) override
+    {
+        config_->enabled = enabled;
+        if (enabled_cb_ && enabled_cb_->isChecked() != enabled)
+            enabled_cb_->setChecked(enabled);
+        // Disabling must also cancel a deferred start: otherwise a pending
+        // endpoint creation could start a now-disabled target.
+        if (!enabled)
+            startRestreamWhenReady_ = false;
+        if (!enabled && IsRunning())
+            obs_output_force_stop(output_);
+        SaveMultiOutputConfig();
+        UpdateStatusDot();
     }
 
     void StartStop()
@@ -1217,17 +1350,26 @@ public:
         QueueOutputUI([this]() {
             restreamState_ = RestreamState::Connecting;
             begin_time_ = clock::now();
+            isConnecting_ = true;
+            isReconnecting_ = false;
+            lastErrorCode_ = 0;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Connecting"));
             remove_btn_->setEnabled(false);
+            UpdateStatusDot();
         });
     }
 
     void OnStarted() override
     {
+        // QueueOutputUI == RunInUIThread plus the output-generation guard
+        // that drops stale callbacks from replaced outputs.
         QueueOutputUI([this]() {
+            isStarting_ = false;
+            isConnecting_ = false;
+            isReconnecting_ = false;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -1237,6 +1379,7 @@ public:
             if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
             ResetInfo();
             timer_->start();
+            UpdateStatusDot();
         });
     }
 
@@ -1244,17 +1387,20 @@ public:
     {
         QueueOutputUI([this]() {
             timer_->stop();
+            isReconnecting_ = true;
 
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
             SetMsg(obs_module_text("Status.Reconnecting"));
+            UpdateStatusDot();
         });
     }
 
     void OnReconnected() override
     {
         QueueOutputUI([this]() {
+            isReconnecting_ = false;
             remove_btn_->setEnabled(false);
             btn_->setText(obs_module_text("Status.Stop"));
             btn_->setEnabled(true);
@@ -1264,6 +1410,7 @@ public:
             if (config_->tiktok.enabled) blog(LOG_INFO, TAG "[TikTokStream] OBS output started");
             ResetInfo();
             timer_->start();
+            UpdateStatusDot();
         });
     }
 
@@ -1282,6 +1429,10 @@ public:
     void OnStopped(int code) override
     {
         QueueOutputUI([this, code]() {
+            isStarting_ = false;
+            isConnecting_ = false;
+            isReconnecting_ = false;
+            lastErrorCode_ = code;
             ReleaseObsOutput();
             if (tiktokSession_.HasEndpoint())
                 blog(LOG_INFO, TAG "[TikTokStream] OBS output stopped; endpoint preserved");
@@ -1320,6 +1471,8 @@ public:
             if (tiktokSession_.state == TikTokSessionState::Error)
                 SetMsg(obs_module_text("TikTok.SessionExpired"));
             if (endAfterStop_) { endAfterStop_ = false; EndTikTokEndpoint(); }
+
+            UpdateStatusDot();
         });
     }
 };

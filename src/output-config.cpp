@@ -52,6 +52,7 @@ static nlohmann::json SaveTarget(OutputTargetConfig& config) {
         tiktok["mature-content"] = config.tiktok.matureContent();
         json["tiktok"] = tiktok;
     }
+    json["enabled"] = config.enabled;
     if (config.videoConfig.has_value())
         json["video-config"] = *config.videoConfig;
     if (config.audioConfig.has_value())
@@ -152,6 +153,7 @@ static OutputTargetConfigPtr LoadTargetConfig(nlohmann::json& json) {
     config->protocol = GetJsonField<std::string>(json, "protocol").value_or("RTMP"); // for compatibility
     config->syncStart = GetJsonField<bool>(json, "sync-start").value_or(false);
     config->syncStop = GetJsonField<bool>(json, "sync-stop").value_or(config->syncStart);
+    config->enabled = GetJsonField<bool>(json, "enabled").value_or(true);
     if (auto tiktok = GetJsonField<nlohmann::json>(json, "tiktok")) {
         config->tiktok.enabled = GetJsonField<bool>(*tiktok, "enabled").value_or(false);
         // Legacy plaintext token: diverted to the one-time migration
@@ -290,6 +292,20 @@ static MultiOutputConfig LoadMultiOutputConfig(const std::string& content) {
         blog(LOG_ERROR, TAG "Fail to parse config json: %s", e.what());
         return {};
     }
+}
+
+std::string SerializeMultiOutputConfig(MultiOutputConfig& config) {
+    return SaveMultiOutputConfig(config);
+}
+
+std::optional<MultiOutputConfig> DeserializeMultiOutputConfig(const std::string& content) {
+    try {
+        auto parsed = nlohmann::json::parse(content);
+        (void)parsed;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return LoadMultiOutputConfig(content);
 }
 
 void SaveMultiOutputConfig() {
