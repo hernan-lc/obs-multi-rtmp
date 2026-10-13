@@ -341,6 +341,19 @@ public:
         if (!fileName.endsWith(".json", Qt::CaseInsensitive))
             fileName += ".json";
 
+        // The backup contains plain RTMP servers/keys. TikTok OAuth tokens
+        // and generated LIVE credentials are never serialized, but ordinary
+        // custom stream keys are sensitive: confirm before writing.
+        auto confirmExport = QMessageBox(
+            QMessageBox::Icon::Warning,
+            obs_module_text("Question.Title"),
+            obs_module_text("Question.ExportSensitive"),
+            QMessageBox::Yes | QMessageBox::No,
+            this
+        ).exec();
+        if (confirmExport != QMessageBox::Yes)
+            return;
+
         auto content = SerializeMultiOutputConfig(GlobalMultiOutputConfig());
 
         QFile file(fileName);

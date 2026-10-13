@@ -159,6 +159,11 @@ class EditOutputWidgetImpl: public EditOutputWidget
 
     std::string targetid_;
     OutputTargetConfigPtr config_ = nullptr;
+    // True when the dialog opened a target with no saved encoder choice at
+    // all (i.e. a brand-new target). Only such targets get the independent
+    // TikTok preset; existing saved choices are never rewritten here.
+    bool freshTarget_ = false;
+    bool tiktokPresetApplied_ = false;
 
     QLineEdit* name_ = 0;
     bool resizeToContentPending_ = false;
@@ -511,6 +516,7 @@ public:
             return;
         }
         config_ = std::make_shared<OutputTargetConfig>(*config_);
+        freshTarget_ = !config_->videoConfig.has_value() && !config_->audioConfig.has_value();
 
         setWindowTitle(obs_module_text("StreamingSettings"));
 
@@ -791,6 +797,12 @@ public:
             updateServiceTab();
             updateOutputTab();
         });
+
+        QObject::connect(tiktokEnable_, &QCheckBox::toggled, [this]() {
+            SaveConfig();
+            LoadConfig();
+            UpdateUI();
+        });
     }
 
     void LoadProtocols()
@@ -903,7 +915,8 @@ public:
         auto ve = venc_->currentData();
 
         // Check for special cases where the encoder is grabbed from some other source (like streaming / recording)
-        if (ve.isValid() && IsSpecialEncoder(ve.toString().toStdString()))
+        const bool sharedVideo = ve.isValid() && IsSpecialEncoder(ve.toString().toStdString());
+        if (sharedVideo)
         {
             v_scene_->setEnabled(false);
             v_resolution_->setEnabled(false);
@@ -929,10 +942,18 @@ public:
         };
 
         auto sharedVideoTargets = GetEncoderShareTargets(false);
-        v_share_notify_->setText(QString::fromUtf8(obs_module_text("EncoderShare") + makeShareNotify(sharedVideoTargets)));
+        if (sharedVideo) {
+            const std::string id = ve.toString().toStdString();
+            v_share_notify_->setText(QString::fromUtf8(obs_module_text(
+                id == OBS_RECORDING_ENC_PLACEHOLDER ? "Encoder.RequiresOBSRecording"
+                                                    : "Encoder.RequiresOBSStreaming")));
+        } else {
+            v_share_notify_->setText(QString::fromUtf8(obs_module_text("EncoderShare") + makeShareNotify(sharedVideoTargets)));
+        }
 
         auto ae = aenc_->currentData();
-        if (ae.isValid() && IsSpecialEncoder(ae.toString().toStdString()))
+        const bool sharedAudio = ae.isValid() && IsSpecialEncoder(ae.toString().toStdString());
+        if (sharedAudio)
         {
             a_mixer_->setEnabled(false);
             a_vod_track_->setEnabled(false);
@@ -944,7 +965,14 @@ public:
         }
 
         auto sharedAudioTargets = GetEncoderShareTargets(true);
-        a_share_notify_->setText(QString::fromUtf8(obs_module_text("EncoderShare") + makeShareNotify(sharedAudioTargets)));
+        if (sharedAudio) {
+            const std::string id = ae.toString().toStdString();
+            a_share_notify_->setText(QString::fromUtf8(obs_module_text(
+                id == OBS_RECORDING_ENC_PLACEHOLDER ? "Encoder.RequiresOBSRecording"
+                                                    : "Encoder.RequiresOBSStreaming")));
+        } else {
+            a_share_notify_->setText(QString::fromUtf8(obs_module_text("EncoderShare") + makeShareNotify(sharedAudioTargets)));
+        }
     }
 
     std::vector<std::string> GetEncoderShareTargets(bool isAudio) {
@@ -1308,6 +1336,52 @@ public:
         }
     }
 
+    // Picks a concrete encoder id for the given codec from a filled
+    // dropdown, preferring the software baseline. Returns -1 when none is
+    // listed (e.g. no matching encoder installed).
+    int PickIndependentEncoder(QComboBox* box, int placeholderMax, const char* codec,
+                               const char* preferredId)
+    {
+        int fallback = -1;
+        for (int i = placeholderMax + 1; i < box->count(); ++i) {
+            const std::string id = box->itemData(i).toString().toStdString();
+            const char* encCodec = obs_get_encoder_codec(id.c_str());
+            if (!encCodec || strcmp(encCodec, codec) != 0)
+                continue;
+            if (preferredId && id == preferredId)
+                return i;
+            if (fallback < 0)
+                fallback = i;
+        }
+        return fallback;
+    }
+
+    // For a brand-new TikTok target still on shared-encoder selections,
+    // default to independent H.264 video + AAC audio so it can stream
+    // without OBS's primary output. Only placeholder selections are
+    // touched: an independent choice the user already made is kept, and
+    // the two tracks are handled independently of each other.
+    void ApplyTikTokIndependentPreset()
+    {
+        tiktokPresetApplied_ = true;
+        auto isSharedSelection = [](QComboBox* box) {
+            auto d = box->currentData();
+            return d.isValid() && IsSpecialEncoder(d.toString().toStdString());
+        };
+        if (isSharedSelection(venc_)) {
+            int idx = PickIndependentEncoder(venc_, max_video_encoder_placeholder_index,
+                                             "h264", "obs_x264");
+            if (idx >= 0)
+                venc_->setCurrentIndex(idx);
+        }
+        if (isSharedSelection(aenc_)) {
+            int idx = PickIndependentEncoder(aenc_, max_audio_encoder_placeholder_index,
+                                             "aac", "ffmpeg_aac");
+            if (idx >= 0)
+                aenc_->setCurrentIndex(idx);
+        }
+    }
+
     void LoadConfig() {
         auto& global = GlobalMultiOutputConfig();
 
@@ -1335,7 +1409,10 @@ public:
                 LoadAudioConfig(&*it);
             }
         }
-        
+
+        if (freshTarget_ && !tiktokPresetApplied_ && config_->tiktok.enabled)
+            ApplyTikTokIndependentPreset();
+
         UpdateUI();
     }
 };
