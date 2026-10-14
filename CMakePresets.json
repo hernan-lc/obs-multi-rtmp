@@ -43,6 +43,7 @@
       "description": "Build for macOS 12.0+ (Universal binary) for CI",
       "generator": "Xcode",
       "cacheVariables": {
+        "ENABLE_TIKTOK_LOGIN": "AUTO",
         "CMAKE_COMPILE_WARNING_AS_ERROR": false,
         "CMAKE_XCODE_ATTRIBUTE_COMPILATION_CACHE_ENABLE_CACHING": "YES",
         "CMAKE_XCODE_ATTRIBUTE_COMPILATION_CACHE_CAS_PATH": "$penv{XCODE_CAS_PATH}"
@@ -75,6 +76,7 @@
       "displayName": "Windows x64 CI build",
       "description": "Build for Windows x64 on CI",
       "cacheVariables": {
+        "ENABLE_TIKTOK_LOGIN": "AUTO",
         "CMAKE_COMPILE_WARNING_AS_ERROR": false
       }
     },
@@ -120,6 +122,7 @@
       "displayName": "Ubuntu x86_64 CI build",
       "description": "Build for Ubuntu x86_64 on CI",
       "cacheVariables": {
+        "ENABLE_TIKTOK_LOGIN": "AUTO",
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_COMPILE_WARNING_AS_ERROR": false,
         "ENABLE_CCACHE": true

@@ -16,6 +16,7 @@ modules:
       - -DCMAKE_INSTALL_LIBDIR=lib
       - -DENABLE_FRONTEND_API=ON
       - -DENABLE_QT=ON
+      - -DENABLE_TIKTOK_LOGIN=AUTO
     post-install:
       - install -Dm644 ${FLATPAK_BUILDER_BUILDDIR}/${FLATPAK_ID}.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
     sources:

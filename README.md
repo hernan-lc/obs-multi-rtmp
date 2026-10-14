@@ -119,6 +119,12 @@ fuzzy-matches an unrelated game. Category suggestions appear as you type.
   manifest works unchanged (libcurl ships with the Freedesktop SDK, network
   access is inherited from OBS). See [FLATPAK.md](./FLATPAK.md).
 
+CI presets and Flatpak use `ENABLE_TIKTOK_LOGIN=AUTO`: embedded login is
+enabled only when the supplied Qt bundle includes WebEngine. Packages built
+without it show the browser-unavailable message. Use `ENABLE_TIKTOK_LOGIN=ON`
+to require login support (configuration fails if WebEngine is missing), or
+`OFF` to disable it. Ubuntu CI installs `qt6-webengine-dev` and `libsecret-1-dev`.
+
 ### Security notes
 
 - OAuth credentials are not stored in `obs-multi-rtmp.json`. The plugin

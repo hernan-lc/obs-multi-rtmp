@@ -6,7 +6,8 @@ project(${_name} VERSION ${_version})
 
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
-option(ENABLE_TIKTOK_LOGIN "Enable embedded TikTok login via Qt WebEngine" ON)
+set(ENABLE_TIKTOK_LOGIN "ON" CACHE STRING "Embedded TikTok login: ON, OFF, or AUTO when WebEngine is available")
+set_property(CACHE ENABLE_TIKTOK_LOGIN PROPERTY STRINGS ON OFF AUTO)
 
 include(compilerconfig)
 include(defaults)
@@ -49,17 +50,21 @@ endif()
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
-  # Qt WebEngine provides the embedded TikTok login browser. Release
-  # builds keep ENABLE_TIKTOK_LOGIN=ON and therefore fail here if the
-  # OBS/Qt bundle cannot provide a functional WebEngine runtime.
-  # Minimal/development builds may set ENABLE_TIKTOK_LOGIN=OFF.
+  # OBS dependency bundles do not always include WebEngine. AUTO uses
+  # the existing unavailable-browser UI; ON still requires WebEngine.
   if(ENABLE_TIKTOK_LOGIN)
-    find_package(Qt6 REQUIRED COMPONENTS WebEngineCore WebEngineWidgets)
+    if(ENABLE_TIKTOK_LOGIN STREQUAL "AUTO")
+      find_package(Qt6 QUIET COMPONENTS WebEngineCore WebEngineWidgets)
+    else()
+      find_package(Qt6 REQUIRED COMPONENTS WebEngineCore WebEngineWidgets)
+    endif()
+  endif()
+  if(ENABLE_TIKTOK_LOGIN AND TARGET Qt6::WebEngineCore AND TARGET Qt6::WebEngineWidgets)
     target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
     target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WITH_TIKTOK_WEBENGINE=1)
     message(STATUS "obs-multi-rtmp: embedded TikTok login enabled")
   else()
-    message(STATUS "obs-multi-rtmp: embedded TikTok login disabled")
+    message(STATUS "obs-multi-rtmp: embedded TikTok login disabled (ENABLE_TIKTOK_LOGIN=${ENABLE_TIKTOK_LOGIN}; WebEngine may be unavailable)")
   endif()
   target_compile_options(
     ${CMAKE_PROJECT_NAME}

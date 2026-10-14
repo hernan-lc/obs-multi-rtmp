@@ -63,12 +63,13 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
       qt6-base-dev${suffix}
       libqt6svg6-dev${suffix}
       qt6-base-private-dev${suffix}
+      qt6-webengine-dev${suffix}
     )
   }
 
   sudo apt-get install ${apt_args} ${_qt_packages}
 
   # Streamlabs TikTok client.
-  sudo apt-get install ${apt_args} libcurl4-openssl-dev${suffix}
+  sudo apt-get install ${apt_args} libcurl4-openssl-dev${suffix} libsecret-1-dev${suffix}
   log_group
 }
