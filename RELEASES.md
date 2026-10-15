@@ -1,22 +1,19 @@
 # Release operations
 
-Builds run in `hernan-lc/obs-multi-rtmp`; the default destination is
-`nglmercer/obs-multi-rtmp`. Merge this PR in the source repository, then sync its
-workflow and script commits into the build repository before tagging. Existing
-Windows, macOS, Ubuntu 24.04/26.04 and Flatpak jobs remain in use.
+Tag pushes build and publish GitHub Releases in the repository running the
+workflow. Windows, macOS, Ubuntu 24.04/26.04 and Flatpak jobs remain in use.
 
 ## Credentials and destination
 
-In the **build repository**, configure Actions variable `RELEASE_REPOSITORY` to
-`nglmercer/obs-multi-rtmp` (also the default). Set it to
-`hernan-lc/obs-multi-rtmp` for local publication. Manual dispatch can override it.
-Same-repository publication always uses `GITHUB_TOKEN` with job-scoped
-`contents: write`. Cross-repository publication requires Actions secret
-`RELEASE_TOKEN`: a fine-grained PAT selected for the destination repository with
-**Contents: read and write**, or a valid GitHub App installation token granting
-that permission. Metadata read is implicit. App tokens expire; arrange token
-refresh before each run rather than storing a long-expired token. No App private
-key or token minting is handled by this workflow.
+Normal releases use the automatic `GITHUB_TOKEN` with job-scoped
+`contents: write` and `actions: read`. No personal token or repository secret
+is needed. For example, a tag pushed to `hernan-lc/obs-multi-rtmp` publishes
+its release in `hernan-lc/obs-multi-rtmp`. The legacy `RELEASE_REPOSITORY`
+variable is ignored so inherited configuration cannot redirect tag releases.
+
+Only an explicit manual `target_repository` selects another repository.
+Cross-repository publication requires a `RELEASE_TOKEN` secret with destination
+Contents read/write access; leave the destination blank for normal publication.
 
 Keep the existing macOS signing/notarization secrets if signed packages are
 required. Protect tags and the default branch in the build repository; only
@@ -38,17 +35,17 @@ compatibility with existing package metadata. Files are renamed, never repacked;
 `release-metadata.json` and release notes record both versions and source SHA.
 Update buildspec separately when the binary/package version should change.
 
-Before pushing a tag to the build repository, push the **same tag and commit**
-to the destination repository. Both lightweight and annotated tags are supported;
-the workflow compares their resolved commit SHAs and refuses mismatches or
-missing tags. It never creates or moves a destination tag automatically.
-For example, after obtaining the merged source commit locally:
+Create and push a tag containing the updated workflows to the repository
+where you want the GitHub Release:
 
 ```sh
-git tag v0.0.3 <merged-source-commit>
-git push origin refs/tags/v0.0.3
-git push https://github.com/hernan-lc/obs-multi-rtmp.git refs/tags/v0.0.3
+git tag v0.1.1 <merged-commit>
+git push origin refs/tags/v0.1.1
 ```
+
+For an explicit cross-repository destination only, push the same tag and commit
+to that repository too. Both lightweight and annotated tags are supported;
+the workflow verifies that the destination tag resolves to the source commit.
 
 Tag pushes automatically build all platforms and publish after manifest
 validation. Required outputs are listed in `.github/scripts/release/manifest.json`:
@@ -63,7 +60,7 @@ artifact contains packages, debug symbols, metadata, checksums and notes.
 From the build repository's default branch, dispatch **Release and recovery**:
 
 - `version`: the existing source tag, including its original `v` spelling.
-- `target_repository`: blank for configured destination; set explicitly for local fallback.
+- `target_repository`: blank publishes in this repository with the built-in token.
 - `mode`: `preserve` by default. Matching existing assets stay intact. Any changed
   checksum fails before upload; choose `replace` only when intentionally repairing
   conflicting files. Unrelated existing assets are preserved in both modes.
@@ -107,5 +104,4 @@ The actionlint config declares the existing Ubuntu 26.04 runner label because
 its current built-in runner catalog does not yet recognize it. Tests cover tag
 syntax/prereleases, missing/empty/conflicting packages, checksums, authentication
 failure, partial uploads, matching retries and invalid recovery provenance.
-Actual platform builds and publication require GitHub runners and configured
-credentials; mocked failure tests do not prove destination authorization.
+Actual platform builds and publication require GitHub runners; mocked failure tests do not prove destination authorization.

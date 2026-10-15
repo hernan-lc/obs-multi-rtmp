@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       target_repository:
-        description: Destination owner/repo (blank uses RELEASE_REPOSITORY or nglmercer/obs-multi-rtmp)
+        description: Destination owner/repo (blank publishes in this repository using the built-in GitHub token)
         type: string
       mode:
         description: Preserve matching assets or explicitly replace conflicting assets
@@ -25,12 +25,15 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: release-${{ inputs.target_repository || vars.RELEASE_REPOSITORY || 'nglmercer/obs-multi-rtmp' }}-${{ inputs.version }}
+  group: release-${{ inputs.target_repository || github.repository }}-${{ inputs.version }}
   cancel-in-progress: false
 jobs:
   prepare:
     if: github.event_name != 'pull_request' && (github.ref_type == 'tag' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -65,7 +68,7 @@ jobs:
       actions: read
     env:
       TAG: ${{ inputs.version }}
-      TARGET: ${{ inputs.target_repository || vars.RELEASE_REPOSITORY || 'nglmercer/obs-multi-rtmp' }}
+      TARGET: ${{ inputs.target_repository || github.repository }}
       SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
       MODE: ${{ inputs.mode || 'preserve' }}
     steps:
@@ -74,7 +77,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           path: source
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           github-token: ${{ github.token }}
@@ -82,7 +85,7 @@ jobs:
           pattern: obs-multi-rtmp-*
       - name: Validate and collect all packages
         run: python3 .github/scripts/release/release.py collect --tag "$TAG" --spec source/buildspec.json --sha "$SOURCE_SHA" --root artifacts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: validated-release-${{ inputs.version }}
           path: release-assets/
