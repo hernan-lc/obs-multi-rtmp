@@ -103,7 +103,7 @@ jobs:
             echo '::error::Cross-repository publication requires RELEASE_TOKEN with destination Contents: write'
             exit 1
           fi
-      - name: Verify destination tag, access and existing assets
+      - name: Verify destination tag and existing assets
         run: python3 .github/scripts/release/github.py preflight
       - name: Upload validated assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

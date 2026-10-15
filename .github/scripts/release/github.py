@@ -50,10 +50,9 @@ def preflight():
         raise ValueError('Invalid target repository')
     if commit(target, tag) != sha:
         raise ValueError('Destination tag differs from source commit. Synchronize the exact tag before publishing.')
-    # Check write access before any publication mutation.
-    permissions = api(f'repos/{target}').get('permissions', {})
-    if not permissions.get('push'):
-        raise ValueError('Release credential requires Contents: write on destination')
+    # Repository permissions.push is not the token's Contents permission and
+    # may be absent for installation tokens (including GITHUB_TOKEN). There is
+    # no read-only release API that proves write access; the upload enforces it.
     result = subprocess.run(['gh', 'api', f'repos/{target}/releases/tags/{quote(tag, safe="")}'], capture_output=True, text=True)
     if result.returncode:
         if '404' not in result.stderr:

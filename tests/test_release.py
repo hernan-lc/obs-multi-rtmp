@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +62,38 @@ class ReleaseTests(unittest.TestCase):
             run.return_value.returncode = 1
             with self.assertRaisesRegex(ValueError, 'Check token'):
                 github.api('repos/example/repo')
+
+    def test_preflight_installation_token_without_repository_permissions(self):
+        env = {'TARGET': 'example/repo', 'TAG': 'v0.1.1', 'SOURCE_SHA': 'abc123'}
+        for existing in (False, True):
+            with self.subTest(existing_release=existing), patch.dict(github.os.environ, env), patch.object(github, 'api') as api, patch.object(github.subprocess, 'run') as run, patch.object(github, 'check_assets') as check:
+                # GitHub installation tokens need not expose permissions.push.
+                api.return_value = {'object': {'type': 'commit', 'sha': 'abc123'}}
+                data = {'assets': [], 'draft': False}
+                run.return_value = SimpleNamespace(
+                    returncode=0 if existing else 1,
+                    stdout=json.dumps(data) if existing else '',
+                    stderr='' if existing else 'HTTP 404: Not Found')
+                github.preflight()
+                api.assert_called_once_with('repos/example/repo/git/ref/tags/v0.1.1')
+                if existing:
+                    check.assert_called_once_with('example/repo', data, require_all=False)
+                else:
+                    check.assert_not_called()
+
+    def test_preflight_rejects_wrong_destination_commit(self):
+        env = {'TARGET': 'example/repo', 'TAG': 'v0.1.1', 'SOURCE_SHA': 'expected'}
+        with patch.dict(github.os.environ, env), patch.object(github, 'commit', return_value='wrong'), patch.object(github.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'Destination tag differs'):
+                github.preflight()
+            run.assert_not_called()
+
+    def test_preflight_rejects_release_access_failure(self):
+        env = {'TARGET': 'example/repo', 'TAG': 'v0.1.1', 'SOURCE_SHA': 'abc123'}
+        with patch.dict(github.os.environ, env), patch.object(github, 'commit', return_value='abc123'), patch.object(github.subprocess, 'run') as run:
+            run.return_value = SimpleNamespace(returncode=1, stderr='HTTP 403: Forbidden')
+            with self.assertRaisesRegex(ValueError, 'Cannot inspect existing release'):
+                github.preflight()
 
     def test_partial_upload(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(github, 'Path') as paths:

@@ -15,6 +15,10 @@ Only an explicit manual `target_repository` selects another repository.
 Cross-repository publication requires a `RELEASE_TOKEN` secret with destination
 Contents read/write access; leave the destination blank for normal publication.
 
+Preflight checks destination tag access and existing asset checksums. Repository
+`permissions.push` does not establish a token's Contents permission, so write
+authorization is enforced by GitHub when publishing the release and its assets.
+
 Keep the existing macOS signing/notarization secrets if signed packages are
 required. Protect tags and the default branch in the build repository; only
 trusted maintainers should be able to dispatch releases or modify workflows.
