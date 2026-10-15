@@ -74,6 +74,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(github, 'Path') as paths:
             asset = Path(tmp) / 'package.zip'
             asset.write_bytes(b'package')
+            paths.side_effect = lambda value: paths.return_value if value == 'release-assets' else Path(value)
             paths.return_value.rglob.return_value = [asset]
             def download(args, **kwargs):
                 kwargs['stdout'].write(b'package')
