@@ -1,0 +1,145 @@
+name: Release and recovery
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing source tag (for example v0.0.3)
+        required: true
+        type: string
+      target_repository:
+        description: Destination owner/repo (blank uses RELEASE_REPOSITORY or nglmercer/obs-multi-rtmp)
+        type: string
+      mode:
+        description: Preserve matching assets or explicitly replace conflicting assets
+        type: choice
+        default: preserve
+        options: [preserve, replace]
+      recovery_run:
+        description: Successful release workflow run ID in this repository (blank rebuilds tag)
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.target_repository || vars.RELEASE_REPOSITORY || 'nglmercer/obs-multi-rtmp' }}-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.event_name != 'pull_request' && (github.ref_type == 'tag' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate tag syntax
+        id: version
+        env:
+          TAG: ${{ inputs.version }}
+        run: python3 .github/scripts/release/release.py version --tag "$TAG"
+      - name: Resolve source and verify recovery provenance
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.version }}
+          RECOVERY_RUN: ${{ inputs.recovery_run }}
+        run: python3 .github/scripts/release/github.py resolve
+  build:
+    needs: prepare
+    if: inputs.recovery_run == ''
+    uses: ./.github/workflows/build-project.yaml
+    with:
+      source_ref: ${{ needs.prepare.outputs.sha }}
+      release_tag: ${{ inputs.version }}
+    secrets: inherit
+  publish:
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success' && (needs.build.result == 'success' || (inputs.recovery_run != '' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      TAG: ${{ inputs.version }}
+      TARGET: ${{ inputs.target_repository || vars.RELEASE_REPOSITORY || 'nglmercer/obs-multi-rtmp' }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+      MODE: ${{ inputs.mode || 'preserve' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: source
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.recovery_run || github.run_id }}
+          pattern: obs-multi-rtmp-*
+      - name: Validate and collect all packages
+        run: python3 .github/scripts/release/release.py collect --tag "$TAG" --spec source/buildspec.json --sha "$SOURCE_SHA" --root artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validated-release-${{ inputs.version }}
+          path: release-assets/
+          if-no-files-found: error
+      - name: Select credential
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          LOCAL_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$TARGET" == "$GITHUB_REPOSITORY" ]]; then
+            echo "GH_TOKEN=$LOCAL_TOKEN" >> "$GITHUB_ENV"
+          elif [[ -n "$RELEASE_TOKEN" ]]; then
+            echo "GH_TOKEN=$RELEASE_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo '::error::Cross-repository publication requires RELEASE_TOKEN with destination Contents: write'
+            exit 1
+          fi
+      - name: Verify destination tag, access and existing assets
+        run: python3 .github/scripts/release/github.py preflight
+      - name: Upload validated assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          token: ${{ env.GH_TOKEN }}
+          repository: ${{ env.TARGET }}
+          tag_name: ${{ inputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body_path: release-assets/NOTES.md
+          overwrite_files: ${{ inputs.mode == 'replace' }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/packages/*
+            release-assets/SHA256SUMS.txt
+            release-assets/release-metadata.json
+      - name: Upload optional debug symbols
+        env:
+          GH_REPO: ${{ env.TARGET }}
+        run: |
+          if [[ -d release-assets/debug ]]; then
+            args=()
+            if [[ "$MODE" == replace ]]; then args+=(--clobber); fi
+            for file in release-assets/debug/*; do
+              name="${file##*/}"
+              if [[ "$MODE" != replace ]] && gh release view "$TAG" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then continue; fi
+              gh release upload "$TAG" "$file" "${args[@]}"
+            done
+          fi
+      - name: Download and verify every expected asset
+        run: python3 .github/scripts/release/github.py verify
+  result:
+    if: always()
+    needs: [prepare, build, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail on any missing publication
+        env:
+          RESULT: ${{ needs.publish.result }}
+        run: test "$RESULT" = success

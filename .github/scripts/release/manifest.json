@@ -1,0 +1,7 @@
+{
+  "windows-x64": [".zip", ".exe"],
+  "macos-universal": [".pkg"],
+  "ubuntu-24.04-x86_64": [".deb"],
+  "ubuntu-26.04-x86_64": [".deb"],
+  "flatpak-x86_64": [".flatpak"]
+}
