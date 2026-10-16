@@ -97,6 +97,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   ./src/protocols.cpp
   ./src/helpers.h
   ./src/helpers.cpp
+  ./src/encoder-source.h
+  ./src/encoder-source.cpp
   ./src/streamlabs-tiktok.h
   ./src/streamlabs-tiktok.cpp
   ./src/tiktok/constants.h
@@ -172,6 +174,10 @@ if(BUILD_TESTING)
   add_test(NAME tiktok-credential-store COMMAND test-tiktok-credential-store)
 
   find_package(Threads REQUIRED)
+  add_executable(test-encoder-source ./tests/test-encoder-source.cpp ./src/encoder-source.cpp)
+  target_include_directories(test-encoder-source PRIVATE ./src ./dep/nlohmann-json)
+  add_test(NAME encoder-source COMMAND test-encoder-source)
+
   add_executable(test-tiktok-cleanup ./tests/test-tiktok-cleanup.cpp ./src/tiktok/cleanup.cpp)
   target_include_directories(test-tiktok-cleanup PRIVATE ./src)
   target_link_libraries(test-tiktok-cleanup PRIVATE Threads::Threads)
