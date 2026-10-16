@@ -11,6 +11,7 @@
 #include <QMetaObject>
 #include "push-widget.h"
 #include "edit-widget.h"
+#include "encoder-source.h"
 #include "output-config.h"
 #include "protocols.h"
 #include "streamlabs-tiktok.h"
@@ -657,6 +658,106 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         return std::nullopt;
     }
 
+    // Snapshot of the OBS profile for Copy modes. Reads only public
+    // frontend/profile APIs; never logs keys or tokens.
+    static ObsProfileView ReadObsProfileView()
+    {
+        ObsProfileView view;
+        config_t *profile = obs_frontend_get_profile_config();
+        if (!profile)
+            return view;
+        auto getStr = [&](const char *section, const char *key) -> std::string {
+            const char *v = config_get_string(profile, section, key);
+            return v ? v : "";
+        };
+        view.outputMode = getStr("Output", "Mode");
+        view.simpleStreamVideo = getStr("SimpleOutput", "StreamEncoder");
+        view.simpleStreamAudio = getStr("SimpleOutput", "StreamAudioEncoder");
+        view.simpleRecVideo = getStr("SimpleOutput", "RecEncoder");
+        view.simpleRecAudio = getStr("SimpleOutput", "RecAudioEncoder");
+        view.advStreamVideo = getStr("AdvOut", "Encoder");
+        view.advStreamAudio = getStr("AdvOut", "AudioEncoder");
+        view.advRecVideo = getStr("AdvOut", "RecEncoder");
+        view.advRecAudio = getStr("AdvOut", "RecAudioEncoder");
+        view.recUsesStreamEncoder = view.advRecVideo.empty() || view.advRecVideo == "none";
+        return view;
+    }
+
+    static std::string CurrentProfileDir()
+    {
+        std::string dir;
+        char *path = obs_frontend_get_current_profile_path();
+        if (path) {
+            dir = path;
+            bfree(path);
+        }
+        return dir;
+    }
+
+    // Copy the *live* encoder's id+settings when it exists (exact snapshot),
+    // else fall back to the profile files. Returns nullopt when neither
+    // yields a usable spec; sets lastEncoderError_ to an actionable key.
+    std::optional<CopiedEncoderSpec> ResolveCopySpec(EncoderSourceMode mode, bool isVideo)
+    {
+        // Prefer the live instance for exact parity when OBS currently has
+        // one; this also covers hardware encoders whose Simple short names
+        // cannot be mapped safely from the profile alone.
+        {
+            OBSOutputAutoRelease src = (mode == EncoderSourceMode::CopyStreaming)
+                                           ? obs_frontend_get_streaming_output()
+                                           : obs_frontend_get_recording_output();
+            obs_encoder_t *live = nullptr;
+            if (src) {
+                live = isVideo ? obs_output_get_video_encoder(src)
+                               : obs_output_get_audio_encoder(src, 0);
+            }
+            if (live) {
+                const char *id = obs_encoder_get_id(live);
+                if (id && *id) {
+                    const obs_data_t *borrowed = obs_encoder_get_settings(live);
+                    // Borrowed settings; copy the JSON text so the new
+                    // encoder owns its settings (snapshot-on-start).
+                    std::string json = "{}";
+                    if (borrowed) {
+                        const char *text = obs_data_get_json((obs_data_t *)borrowed);
+                        if (text && *text)
+                            json = text;
+                    }
+                    return CopiedEncoderSpec{std::string(id), json};
+                }
+            }
+        }
+        EncoderResolveError err = EncoderResolveError::None;
+        auto spec = SnapshotCopyEncoder(ReadObsProfileView(), CurrentProfileDir(), mode, isVideo, &err);
+        if (!spec && err == EncoderResolveError::CopyUnresolvable)
+            lastEncoderError_ = "Error.CopyEncoderUnresolvable";
+        else if (!spec)
+            lastEncoderError_ = EncoderResolveErrorKey(err);
+        return spec;
+    }
+
+    // Borrowed live OBS encoder for a Share mode, or null when the OBS
+    // source output/encoder is not ready. Never creates or mutates.
+    static obs_encoder_t *BorrowSharedVideoEncoder(EncoderSourceMode mode)
+    {
+        OBSOutputAutoRelease src = (mode == EncoderSourceMode::ShareStreaming)
+                                       ? obs_frontend_get_streaming_output()
+                                       : obs_frontend_get_recording_output();
+        if (!src)
+            return nullptr;
+        return obs_output_get_video_encoder(src);
+    }
+
+    static obs_encoder_t *BorrowSharedAudioEncoder(EncoderSourceMode mode, size_t slot)
+    {
+        OBSOutputAutoRelease src = (mode == EncoderSourceMode::ShareStreaming)
+                                       ? obs_frontend_get_streaming_output()
+                                       : obs_frontend_get_recording_output();
+        if (!src)
+            return nullptr;
+        return obs_output_get_audio_encoder(src, slot);
+    }
+
     // Resolves the configured video encoder and returns an OWNING reference
     // (libobs output setters take their own reference from the raw pointer,
     // so callers must pass .Get() without an extra get_ref).
@@ -667,10 +768,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         lastEncoderError_ = nullptr;
         auto config_id = config_->videoConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
         if (config_id == "" || config_id == OBS_STREAMING_ENC_PLACEHOLDER) {
-            OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
-            OBSEncoder enc = stream_output ? obs_output_get_video_encoder(stream_output) : nullptr;
+            OBSEncoder enc = BorrowSharedVideoEncoder(EncoderSourceMode::ShareStreaming);
             if (!enc) {
-                blog(LOG_WARNING, TAG "Shared OBS streaming encoder unavailable for '%s'.",
+                blog(LOG_WARNING, TAG "Shared OBS streaming encoder unavailable for '%s'. "
+                                      "Start OBS streaming first, or choose Copy/Custom.",
                      config_->name.c_str());
                 lastEncoderError_ = "Error.SharedEncoderUnavailable";
                 return {};
@@ -678,16 +779,51 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             using_main_video_encoder_ = true;
             return enc;
         } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
-            OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
-            OBSEncoder enc = stream_output ? obs_output_get_video_encoder(stream_output) : nullptr;
+            OBSEncoder enc = BorrowSharedVideoEncoder(EncoderSourceMode::ShareRecording);
             if (!enc) {
-                blog(LOG_WARNING, TAG "Shared OBS recording encoder unavailable for '%s'.",
+                blog(LOG_WARNING, TAG "Shared OBS recording encoder unavailable for '%s'. "
+                                      "Start OBS recording first, or choose Copy/Custom.",
                      config_->name.c_str());
                 lastEncoderError_ = "Error.SharedEncoderUnavailable";
                 return {};
             }
             using_main_video_encoder_ = true;
             return enc;
+        } else if (config_id == OBS_STREAMING_COPY_PLACEHOLDER ||
+                   config_id == OBS_RECORDING_COPY_PLACEHOLDER) {
+            // Copy OBS configured settings into an independent encoder.
+            // Snapshot-on-start: OBS changes apply on the next start, never
+            // hot-applied mid-stream. Works while OBS is idle.
+            EncoderSourceMode mode = ResolveEncoderSourceMode(config_id);
+            OBSEncoderAutoRelease existing = obs_get_encoder_by_name(VideoEncoderName().c_str());
+            if (existing) {
+                using_main_video_encoder_ = false;
+                OBSEncoder owned = existing.Get();
+                return owned;
+            }
+            auto spec = ResolveCopySpec(mode, true);
+            if (!spec) {
+                if (!lastEncoderError_)
+                    lastEncoderError_ = "Error.CopyEncoderUnresolvable";
+                blog(LOG_WARNING, TAG "Copy OBS video settings unresolvable for '%s' (mode=%s).",
+                     config_->name.c_str(), config_id.c_str());
+                return {};
+            }
+            OBSDataAutoRelease settings = obs_data_create_from_json(spec->settingsJson.c_str());
+            OBSEncoderAutoRelease enc =
+                obs_video_encoder_create(spec->encoderId.c_str(), VideoEncoderName().c_str(),
+                                         settings, nullptr);
+            if (!enc) {
+                blog(LOG_ERROR, TAG "Failed to create copied video encoder '%s' for '%s'.",
+                     spec->encoderId.c_str(), config_->name.c_str());
+                lastEncoderError_ = "Error.CreateEncoder";
+                return {};
+            }
+            blog(LOG_INFO, TAG "Copy video settings for '%s': encoder=%s (snapshot-on-start).",
+                 config_->name.c_str(), spec->encoderId.c_str());
+            using_main_video_encoder_ = false;
+            OBSEncoder owned = enc.Get();
+            return owned;
         } else {
             OBSEncoderAutoRelease enc = obs_get_encoder_by_name(VideoEncoderName().c_str());
             if (!enc) {
@@ -742,10 +878,10 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
         lastEncoderError_ = nullptr;
         auto config_id = config_->audioConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
         if (config_id == "" || config_id == OBS_STREAMING_ENC_PLACEHOLDER) {
-            OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
-            OBSEncoder enc = stream_output ? obs_output_get_audio_encoder(stream_output, 0) : nullptr;
+            OBSEncoder enc = BorrowSharedAudioEncoder(EncoderSourceMode::ShareStreaming, 0);
             if (!enc) {
-                blog(LOG_WARNING, TAG "Shared OBS streaming audio encoder unavailable for '%s'.",
+                blog(LOG_WARNING, TAG "Shared OBS streaming audio encoder unavailable for '%s'. "
+                                      "Start OBS streaming first, or choose Copy/Custom.",
                      config_->name.c_str());
                 lastEncoderError_ = "Error.SharedEncoderUnavailable";
                 return {};
@@ -753,16 +889,61 @@ class PushWidgetImpl : public PushWidget, public IOBSOutputEventHanlder
             using_main_audio_encoder_ = true;
             return enc;
         } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
-            OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
-            OBSEncoder enc = stream_output ? obs_output_get_audio_encoder(stream_output, 0) : nullptr;
+            // Recording outputs may carry multiple tracks; slot 0 is the
+            // primary track. A missing slot 0 is a track problem, not a
+            // generic unavailability, so it gets its own message.
+            OBSEncoder enc = BorrowSharedAudioEncoder(EncoderSourceMode::ShareRecording, 0);
             if (!enc) {
-                blog(LOG_WARNING, TAG "Shared OBS recording audio encoder unavailable for '%s'.",
-                     config_->name.c_str());
-                lastEncoderError_ = "Error.SharedEncoderUnavailable";
+                OBSOutputAutoRelease rec = obs_frontend_get_recording_output();
+                if (!rec) {
+                    blog(LOG_WARNING, TAG "Shared OBS recording audio unavailable for '%s': "
+                                          "recording output inactive.",
+                         config_->name.c_str());
+                    lastEncoderError_ = "Error.SharedEncoderUnavailable";
+                } else {
+                    blog(LOG_WARNING, TAG "Shared OBS recording audio track 1 unavailable for '%s'.",
+                         config_->name.c_str());
+                    lastEncoderError_ = "Error.MissingAudioTrack";
+                }
                 return {};
             }
             using_main_audio_encoder_ = true;
             return enc;
+        } else if (config_id == OBS_STREAMING_COPY_PLACEHOLDER ||
+                   config_id == OBS_RECORDING_COPY_PLACEHOLDER) {
+            EncoderSourceMode mode = ResolveEncoderSourceMode(config_id);
+            if (trackIdx < 0 || trackIdx >= 6) {
+                lastEncoderError_ = "Error.InvalidAudioConfig";
+                return {};
+            }
+            OBSEncoderAutoRelease existing = obs_get_encoder_by_name(AudioEncoderName(trackIdx).c_str());
+            if (existing) {
+                using_main_audio_encoder_ = false;
+                OBSEncoder owned = existing.Get();
+                return owned;
+            }
+            auto spec = ResolveCopySpec(mode, false);
+            if (!spec) {
+                if (!lastEncoderError_)
+                    lastEncoderError_ = "Error.CopyEncoderUnresolvable";
+                return {};
+            }
+            // Copied audio encoders attach to the main mix (mixer 0); the
+            // track slot is resolved by the caller via trackIdx.
+            OBSDataAutoRelease settings = obs_data_create_from_json(spec->settingsJson.c_str());
+            OBSEncoderAutoRelease enc = obs_audio_encoder_create(
+                spec->encoderId.c_str(), AudioEncoderName(trackIdx).c_str(), settings, 0, nullptr);
+            if (!enc) {
+                blog(LOG_ERROR, TAG "Failed to create copied audio encoder '%s' for '%s'.",
+                     spec->encoderId.c_str(), config_->name.c_str());
+                lastEncoderError_ = "Error.CreateEncoder";
+                return {};
+            }
+            blog(LOG_INFO, TAG "Copy audio settings for '%s': encoder=%s (snapshot-on-start).",
+                 config_->name.c_str(), spec->encoderId.c_str());
+            using_main_audio_encoder_ = false;
+            OBSEncoder owned = enc.Get();
+            return owned;
         } else {
             OBSEncoderAutoRelease enc = obs_get_encoder_by_name(AudioEncoderName(trackIdx).c_str());
             if (!enc) {
@@ -1210,17 +1391,27 @@ public:
     const char* ValidateLocalEncoderConfiguration()
     {
         std::string customVideoId;
+        std::string sharedVideoCodec;
+        std::string copyVideoId;
         // Video track: existence, values, scene, shared availability.
         {
             auto config_id = config_->videoConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
-            if (config_id == "" || config_id == OBS_STREAMING_ENC_PLACEHOLDER) {
-                OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
-                if (!stream_output || !obs_output_get_video_encoder(stream_output))
+            EncoderSourceMode mode = ResolveEncoderSourceMode(config_id);
+            if (mode == EncoderSourceMode::ShareStreaming ||
+                mode == EncoderSourceMode::ShareRecording) {
+                obs_encoder_t *live = BorrowSharedVideoEncoder(mode);
+                if (!live)
                     return "Error.SharedEncoderUnavailable";
-            } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
-                OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
-                if (!stream_output || !obs_output_get_video_encoder(stream_output))
-                    return "Error.SharedEncoderUnavailable";
+                const char *codec = obs_encoder_get_codec(live);
+                if (codec && *codec)
+                    sharedVideoCodec = codec;
+            } else if (mode == EncoderSourceMode::CopyStreaming ||
+                       mode == EncoderSourceMode::CopyRecording) {
+                auto view = ReadObsProfileView();
+                auto id = ResolveCopyVideoEncoderId(view, mode);
+                if (!id || id->empty())
+                    return "Error.CopyEncoderUnresolvable";
+                copyVideoId = *id;
             } else {
                 auto& global = GlobalMultiOutputConfig();
                 auto videoConfig = FindById(global.videoConfig, config_id);
@@ -1242,16 +1433,35 @@ public:
         }
         // Audio track: existence, values, shared availability (track 0).
         std::string customAudioEncoder;
+        std::string sharedAudioCodec;
+        std::string copyAudioId;
         {
             auto config_id = config_->audioConfig.value_or(OBS_STREAMING_ENC_PLACEHOLDER);
-            if (config_id == "" || config_id == OBS_STREAMING_ENC_PLACEHOLDER) {
-                OBSOutputAutoRelease stream_output = obs_frontend_get_streaming_output();
-                if (!stream_output || !obs_output_get_audio_encoder(stream_output, 0))
+            EncoderSourceMode mode = ResolveEncoderSourceMode(config_id);
+            if (mode == EncoderSourceMode::ShareStreaming) {
+                obs_encoder_t *live = BorrowSharedAudioEncoder(mode, 0);
+                if (!live)
                     return "Error.SharedEncoderUnavailable";
-            } else if (config_id == OBS_RECORDING_ENC_PLACEHOLDER) {
-                OBSOutputAutoRelease stream_output = obs_frontend_get_recording_output();
-                if (!stream_output || !obs_output_get_audio_encoder(stream_output, 0))
+                const char *codec = obs_encoder_get_codec(live);
+                if (codec && *codec)
+                    sharedAudioCodec = codec;
+            } else if (mode == EncoderSourceMode::ShareRecording) {
+                OBSOutputAutoRelease rec = obs_frontend_get_recording_output();
+                if (!rec)
                     return "Error.SharedEncoderUnavailable";
+                obs_encoder_t *live = obs_output_get_audio_encoder(rec, 0);
+                if (!live)
+                    return "Error.MissingAudioTrack";
+                const char *codec = obs_encoder_get_codec(live);
+                if (codec && *codec)
+                    sharedAudioCodec = codec;
+            } else if (mode == EncoderSourceMode::CopyStreaming ||
+                       mode == EncoderSourceMode::CopyRecording) {
+                auto view = ReadObsProfileView();
+                auto id = ResolveCopyAudioEncoderId(view, mode);
+                if (!id || id->empty())
+                    return "Error.CopyEncoderUnresolvable";
+                copyAudioId = *id;
             } else {
                 auto& global = GlobalMultiOutputConfig();
                 auto audioConfig = FindById(global.audioConfig, config_id);
@@ -1271,27 +1481,56 @@ public:
         // null codec for unknown IDs, and an unregistered encoder could
         // otherwise pass every check above, mint a remote LIVE, and only
         // fail when the real encoder is created afterwards.
-        const char* videoCodec =
-            customVideoId.empty() ? "" : obs_get_encoder_codec(customVideoId.c_str());
-        const char* audioCodec = customAudioEncoder.empty()
-                                     ? ""
-                                     : obs_get_encoder_codec(customAudioEncoder.c_str());
-        if (!customVideoId.empty() && (!videoCodec || !*videoCodec))
+        auto codecOf = [](const std::string &id) -> const char * {
+            if (id.empty())
+                return "";
+            return obs_get_encoder_codec(id.c_str());
+        };
+        const char* videoCodec = codecOf(customVideoId.empty() ? copyVideoId : customVideoId);
+        const char* audioCodec = codecOf(customAudioEncoder.empty() ? copyAudioId : customAudioEncoder);
+        if ((!customVideoId.empty() || !copyVideoId.empty()) && (!videoCodec || !*videoCodec))
             return "Error.CreateEncoder";
-        if (!customAudioEncoder.empty() && (!audioCodec || !*audioCodec))
+        if ((!customAudioEncoder.empty() || !copyAudioId.empty()) && (!audioCodec || !*audioCodec))
             return "Error.CreateEncoder";
-        // Codec support of the chosen independent encoders against the
-        // output. Placeholders were checked for availability above.
-        if (!customVideoId.empty() || !customAudioEncoder.empty()) {
-            if (!CreateObsOutput())
-                return "Error.StartOutput";
-            auto cleanup = finally([this] { ReleaseObsOutput(); });
-            if (!customVideoId.empty() &&
-                !CodecInList(obs_output_get_supported_video_codecs(output_), videoCodec))
+        // Codec support against the output for every mode, including shared
+        // instances read from the live encoder. A temporary output is
+        // created for the check and always destroyed here.
+        if (!CreateObsOutput())
+            return "Error.StartOutput";
+        auto cleanup = finally([this] { ReleaseObsOutput(); });
+        auto checkVideo = [&](const char *codec) -> const char * {
+            if (!codec || !*codec)
+                return nullptr;
+            if (!CodecSupportedByOutput(obs_output_get_supported_video_codecs(output_) ?
+                                            obs_output_get_supported_video_codecs(output_) : "",
+                                        codec))
                 return "Error.UnsupportedVideoCodec";
-            if (!customAudioEncoder.empty() &&
-                !CodecInList(obs_output_get_supported_audio_codecs(output_), audioCodec))
+            return nullptr;
+        };
+        auto checkAudio = [&](const char *codec) -> const char * {
+            if (!codec || !*codec)
+                return nullptr;
+            if (!CodecSupportedByOutput(obs_output_get_supported_audio_codecs(output_) ?
+                                            obs_output_get_supported_audio_codecs(output_) : "",
+                                        codec))
                 return "Error.UnsupportedAudioCodec";
+            return nullptr;
+        };
+        if (!sharedVideoCodec.empty()) {
+            if (const char *err = checkVideo(sharedVideoCodec.c_str()))
+                return err;
+        }
+        if (!sharedAudioCodec.empty()) {
+            if (const char *err = checkAudio(sharedAudioCodec.c_str()))
+                return err;
+        }
+        if (!customVideoId.empty() || !copyVideoId.empty()) {
+            if (const char *err = checkVideo(videoCodec))
+                return err;
+        }
+        if (!customAudioEncoder.empty() || !copyAudioId.empty()) {
+            if (const char *err = checkAudio(audioCodec))
+                return err;
         }
         return nullptr;
     }
@@ -1492,21 +1731,61 @@ public:
         else obs_output_stop(output_);
     }
 
+    bool UsesSharedStreamingEncoder() const
+    {
+        return ResolveEncoderSourceMode(config_->videoConfig) == EncoderSourceMode::ShareStreaming ||
+               ResolveEncoderSourceMode(config_->audioConfig) == EncoderSourceMode::ShareStreaming;
+    }
+
+    bool UsesSharedRecordingEncoder() const
+    {
+        return ResolveEncoderSourceMode(config_->videoConfig) == EncoderSourceMode::ShareRecording ||
+               ResolveEncoderSourceMode(config_->audioConfig) == EncoderSourceMode::ShareRecording;
+    }
+
     void OnOBSEvent(obs_frontend_event ev) override
     {
-        if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_EXIT
-            || ev == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_CHANGED
+        using ev_t = obs_frontend_event;
+        if (ev == ev_t::OBS_FRONTEND_EVENT_EXIT
+            || ev == ev_t::OBS_FRONTEND_EVENT_PROFILE_CHANGED
         ) {
             Stop();
-        } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED) {
+        } else if (ev == ev_t::OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED) {
             StopRestream();
-        } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTING) {
+        } else if (ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STARTING ||
+                   ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STARTED) {
+            // Prefer STARTED (shared streaming encoders are guaranteed
+            // ready); STARTING is kept as a fallback so sync-start stays
+            // responsive. StartStop()/StartStreaming() are exactly-once via
+            // IsRunning()/restreamState_/isStarting_ guards.
             if (!IsRunning() && config_->syncStart) {
                 StartStop();
             }
-        } else if (ev == obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
+        } else if (ev == ev_t::OBS_FRONTEND_EVENT_RECORDING_STARTED) {
+            if (!IsRunning() && config_->syncStart) {
+                StartStop();
+            }
+        } else if (ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPING ||
+                   ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
             if (config_->syncStop && (IsRunning() || restreamState_ != RestreamState::Stopped ||
                                       startRestreamWhenReady_)) {
+                StopStreaming();
+            }
+            // A share-streaming target cannot outlive the OBS streaming
+            // encoder it borrows: stop it gracefully instead of promising
+            // continued availability.
+            if ((ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPED ||
+                 ev == ev_t::OBS_FRONTEND_EVENT_STREAMING_STOPPING) &&
+                UsesSharedStreamingEncoder() && IsRunning()) {
+                blog(LOG_INFO, TAG "Stopping dependent target '%s': OBS streaming stopped.",
+                     config_->name.c_str());
+                StopStreaming();
+            }
+        } else if (ev == ev_t::OBS_FRONTEND_EVENT_RECORDING_STOPPING ||
+                   ev == ev_t::OBS_FRONTEND_EVENT_RECORDING_STOPPED) {
+            if (UsesSharedRecordingEncoder() && IsRunning()) {
+                blog(LOG_INFO, TAG "Stopping dependent target '%s': OBS recording stopped.",
+                     config_->name.c_str());
                 StopStreaming();
             }
         }
