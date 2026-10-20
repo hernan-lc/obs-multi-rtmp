@@ -137,8 +137,9 @@ jobs:
         id: xcode-cache
         with:
           path: ${{ steps.setup.outputs.xcodeCasPath }}
-          key: ${{ runner.os }}-xcode-${{ needs.check-event.outputs.config }}
+          key: ${{ runner.os }}-xcode-${{ needs.check-event.outputs.config }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-xcode-${{ needs.check-event.outputs.config }}-
             ${{ runner.os }}-xcode-
 
       - name: Set Up Codesigning 🔑
@@ -198,7 +199,7 @@ jobs:
         if: github.event_name != 'pull_request' && steps.xcode-cache.outputs.cache-hit != 'true'
         with:
           path: ${{ steps.setup.outputs.xcodeCasPath }}
-          key: ${{ runner.os }}-xcode-${{ needs.check-event.outputs.config }}
+          key: ${{ runner.os }}-xcode-${{ needs.check-event.outputs.config }}-${{ github.sha }}
 
   flatpak-build:
     name: Build Flatpak 📦
@@ -279,8 +280,9 @@ jobs:
         id: ccache-cache
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}
+          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}-
             ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-
 
       - name: Build Plugin 🧱
@@ -315,7 +317,7 @@ jobs:
         if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}
+          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}-${{ github.sha }}
 
   windows-build:
     name: Build for Windows 🪟

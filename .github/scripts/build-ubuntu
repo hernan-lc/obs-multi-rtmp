@@ -207,7 +207,9 @@ ${_usage_host:-}"
         local cmake_version
         read -r _ _ cmake_version <<< "$(cmake --version)"
 
-        cmake_build_args+=(--preset ${_preset}-${target##*-} --config ${config})
+        # Match the macOS packaging build: compile the plugin and its
+        # dependencies. Test targets remain available for explicit builds.
+        cmake_build_args+=(--preset ${_preset}-${target##*-} --config ${config} --target ${product_name})
         if [[ ${generator} == 'Unix Makefiles' ]] {
           cmake_build_args+=(--parallel $(( $(nproc) + 1 )))
         } else {

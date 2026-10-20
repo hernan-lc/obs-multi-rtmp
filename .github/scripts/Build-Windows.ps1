@@ -36,6 +36,11 @@ function Build {
 
     $ScriptHome = $PSScriptRoot
     $ProjectRoot = Resolve-Path -Path "$PSScriptRoot/../.."
+    $BuildSpec = Get-Content -LiteralPath (Join-Path $ProjectRoot 'buildspec.json') -Raw | ConvertFrom-Json
+    $ProductName = $BuildSpec.name
+    if ( [string]::IsNullOrWhiteSpace($ProductName) ) {
+        throw 'buildspec.json must define the plugin name.'
+    }
 
     $UtilityFunctions = Get-ChildItem -Path $PSScriptRoot/utils.pwsh/*.ps1 -Recurse
 
@@ -60,6 +65,9 @@ function Build {
     $CmakeBuildArgs += @(
         '--preset', "windows-${Target}"
         '--config', $Configuration
+        # Packaging needs the plugin and its dependencies; tests can still
+        # be built explicitly through the normal CMake build presets.
+        '--target', $ProductName
         '--parallel'
         '--', '/consoleLoggerParameters:Summary', '/noLogo'
     )
