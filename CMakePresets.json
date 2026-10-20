@@ -76,7 +76,8 @@
       "displayName": "Windows x64 CI build",
       "description": "Build for Windows x64 on CI",
       "cacheVariables": {
-        "ENABLE_TIKTOK_LOGIN": "AUTO",
+        "ENABLE_TIKTOK_LOGIN": "ON",
+        "TIKTOK_BROWSER_BACKEND": "webview2",
         "CMAKE_COMPILE_WARNING_AS_ERROR": false
       }
     },

@@ -140,6 +140,10 @@ if(ENABLE_QT)
     message(STATUS "obs-multi-rtmp: embedded TikTok login enabled (browser backend: ${TIKTOK_BROWSER_BACKEND_SELECTED})")
   endif()
 
+  # Marker file so the build pipeline can verify which backend was built
+  # instead of trusting a successful compilation.
+  file(WRITE "${CMAKE_BINARY_DIR}/tiktok-browser-backend.txt" "${TIKTOK_BROWSER_BACKEND_SELECTED}\n")
+
   target_compile_options(
     ${CMAKE_PROJECT_NAME}
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
@@ -285,6 +289,53 @@ if(BUILD_TESTING)
     target_include_directories(test-tiktok-auth-flow PRIVATE ./src)
     target_link_libraries(test-tiktok-auth-flow PRIVATE Qt6::Core)
     add_test(NAME tiktok-auth-flow COMMAND test-tiktok-auth-flow)
+
+    # Browser backend contract: readiness, failure, queued navigation and
+    # cleanup with a mock backend (no real browser is started).
+    add_executable(test-tiktok-auth-browser
+      ./tests/test-tiktok-auth-browser.cpp
+      ./src/tiktok/auth-browser.cpp)
+    target_include_directories(test-tiktok-auth-browser PRIVATE ./src)
+    target_link_libraries(test-tiktok-auth-browser PRIVATE Qt6::Core)
+    set_target_properties(test-tiktok-auth-browser PROPERTIES AUTOMOC ON)
+    add_test(NAME tiktok-auth-browser COMMAND test-tiktok-auth-browser)
+    set_tests_properties(tiktok-auth-browser PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Factory selection rules (platform preference, no silent downgrade).
+    add_executable(test-tiktok-auth-browser-factory
+      ./tests/test-tiktok-auth-browser-factory.cpp
+      ./src/tiktok/auth-browser-factory.cpp)
+    target_include_directories(test-tiktok-auth-browser-factory PRIVATE ./src)
+    target_link_libraries(test-tiktok-auth-browser-factory PRIVATE Qt6::Core)
+    set_target_properties(test-tiktok-auth-browser-factory PROPERTIES AUTOMOC ON)
+    if(TIKTOK_HAVE_WEBENGINE)
+      # The factory creates the configured backend, so its implementation is
+      # needed for linking.
+      target_sources(test-tiktok-auth-browser-factory PRIVATE
+        ./src/tiktok/auth-webengine.cpp
+        ./src/tiktok/auth-browser.cpp
+        ./src/tiktok/auth-profile.cpp)
+      target_compile_definitions(test-tiktok-auth-browser-factory PRIVATE WITH_TIKTOK_WEBENGINE=1)
+      target_link_libraries(test-tiktok-auth-browser-factory PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
+    endif()
+    if(TIKTOK_HAVE_WEBVIEW2)
+      target_sources(test-tiktok-auth-browser-factory PRIVATE
+        ./src/tiktok/auth-webview2.cpp
+        ./src/tiktok/auth-browser.cpp
+        ./src/tiktok/auth-profile.cpp
+        ./src/tiktok/auth-jsvalue.cpp)
+      target_compile_definitions(test-tiktok-auth-browser-factory PRIVATE WITH_TIKTOK_WEBVIEW2=1)
+      target_include_directories(test-tiktok-auth-browser-factory PRIVATE ${TIKTOK_WEBVIEW2_INCLUDE_DIR})
+      target_link_libraries(test-tiktok-auth-browser-factory PRIVATE "${TIKTOK_WEBVIEW2_LIBRARY}")
+    endif()
+    add_test(NAME tiktok-auth-browser-factory COMMAND test-tiktok-auth-browser-factory)
+    set_tests_properties(tiktok-auth-browser-factory PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # WebView2 style JavaScript result conversion (JSON -> QVariant).
+    add_executable(test-tiktok-auth-jsvalue ./tests/test-tiktok-auth-jsvalue.cpp ./src/tiktok/auth-jsvalue.cpp)
+    target_include_directories(test-tiktok-auth-jsvalue PRIVATE ./src)
+    target_link_libraries(test-tiktok-auth-jsvalue PRIVATE Qt6::Core)
+    add_test(NAME tiktok-auth-jsvalue COMMAND test-tiktok-auth-jsvalue)
   endif()
 endif()
 

@@ -222,6 +222,20 @@ ${_usage_host:-}"
 
     cmake ${cmake_args}
 
+    # Report the selected login backend: a silent "no browser" build must
+    # not pass unnoticed.
+    local backend_marker="build_${target##*-}/tiktok-browser-backend.txt"
+    if [[ -r ${backend_marker} ]] {
+      local backend
+      backend="$(<${backend_marker})"
+      log_info "TikTok login backend: ${backend}"
+      if [[ ${backend} == 'none' ]] {
+        log_warning 'No TikTok login backend was configured: the packaged plugin cannot log in.'
+      }
+    } else {
+      log_warning "The build did not report a TikTok login backend (${backend_marker} is missing)."
+    }
+
     log_group "Building ${product_name}..."
     cmake ${cmake_build_args}
   }

@@ -26,9 +26,10 @@
 #include <QString>
 #include <QUrl>
 #include <QVariant>
-#include <QWidget>
 
 #include <functional>
+
+class QWidget;
 
 // Concrete browser backends the plugin can be built with.
 enum class TikTokAuthBackend {

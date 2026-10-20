@@ -73,11 +73,37 @@ function Build {
     Log-Group "Configuring ${ProductName}..."
     Invoke-External cmake @CmakeArgs
 
+    # The official Windows builds must ship a working login backend: verify
+    # the configured one instead of trusting a successful compilation.
+    $BackendMarker = Join-Path $ProjectRoot "build_${Target}/tiktok-browser-backend.txt"
+    if ( ! ( Test-Path -LiteralPath $BackendMarker ) ) {
+        throw "The build did not report a TikTok login browser backend (${BackendMarker} is missing)."
+    }
+    $Backend = (Get-Content -LiteralPath $BackendMarker -Raw).Trim()
+    if ( $Backend -ne 'webview2' ) {
+        throw "The Windows build must use the WebView2 login backend, but '${Backend}' was configured."
+    }
+    Log-Information "TikTok login backend: ${Backend}"
+
     Log-Group "Building ${ProductName}..."
     Invoke-External cmake @CmakeBuildArgs
 
+    # The WebView2 loader has to sit next to the plugin, otherwise the
+    # login window cannot start.
+    $PluginDir = Join-Path $ProjectRoot "build_${Target}/${Configuration}"
+    $Loader = Get-ChildItem -Path $PluginDir -Filter 'WebView2Loader.dll' -Recurse -ErrorAction 'SilentlyContinue' | Select-Object -First 1
+    if ( ! $Loader ) {
+        throw "WebView2Loader.dll was not produced next to the plugin."
+    }
+    Log-Information "WebView2 loader: $($Loader.FullName)"
+
     Log-Group "Installing ${ProductName}..."
     Invoke-External cmake @CmakeInstallArgs
+
+    $InstalledLoader = Join-Path $ProjectRoot "release/${Configuration}/${ProductName}/bin/64bit/WebView2Loader.dll"
+    if ( ! ( Test-Path -LiteralPath $InstalledLoader ) ) {
+        throw "WebView2Loader.dll is missing from the installed plugin layout (${InstalledLoader})."
+    }
 
     Pop-Location -Stack BuildTemp
     Log-Group

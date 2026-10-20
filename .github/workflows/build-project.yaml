@@ -359,6 +359,53 @@ jobs:
           config: ${{ needs.check-event.outputs.config }}
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
 
+      - name: Verify Package Contents 📦
+        shell: pwsh
+        run: |
+          # The released package must contain the plugin and the WebView2
+          # loader, otherwise the TikTok login cannot start.
+          $zip = Get-ChildItem -Path "${{ github.workspace }}/release" -Filter '*-windows-x64.zip' |
+            Select-Object -First 1
+          if ( ! $zip ) {
+            throw 'The Windows package was not created.'
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          try {
+            $entries = $archive.Entries | ForEach-Object { $_.FullName }
+            $entries | ForEach-Object { Write-Host "  $_" }
+            if ( ! ($entries -match 'obs-plugins/64bit/obs-multi-rtmp.dll') ) {
+              throw 'The plugin binary is missing from the package.'
+            }
+            if ( ! ($entries -match 'WebView2Loader.dll') ) {
+              throw 'WebView2Loader.dll is missing from the package.'
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          Write-Host 'Package contents verified.'
+
+      - name: Check WebView2 Runtime 🔍
+        shell: pwsh
+        run: |
+          # The Evergreen WebView2 runtime is a runtime requirement of the
+          # plugin, not of the build. Report it so the manual test matrix
+          # knows what to expect on the runner.
+          $clientId = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $found = $false
+          foreach ( $root in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients',
+                                'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients') ) {
+            $key = Join-Path $root $clientId
+            if ( Test-Path $key ) {
+              $version = (Get-ItemProperty -Path $key -ErrorAction 'SilentlyContinue').pv
+              Write-Host "WebView2 runtime detected: ${version}"
+              $found = $true
+            }
+          }
+          if ( ! $found ) {
+            Write-Warning 'The WebView2 runtime was not detected on this runner. The plugin still builds, but the login window cannot be exercised here.'
+          }
+
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v6
         with:

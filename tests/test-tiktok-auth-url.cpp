@@ -150,8 +150,32 @@ static int TestLiveAccessResultUrl()
     return 0;
 }
 
-static int TestLogSafeForms()
+static int TestExpectedExchangePage()
 {
+    // The privileged exchange may only run on the HTTPS Streamlabs success
+    // document.
+    CHECK(TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("https://streamlabs.com/dashboard?success=true&code=ABC"), "streamlabs.com/dashboard"));
+    CHECK(TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("https://www.streamlabs.com/dashboard?code=ABC"), "www.streamlabs.com/dashboard"));
+    // Plain HTTP is never acceptable.
+    CHECK(!TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("http://streamlabs.com/dashboard?code=ABC"), "streamlabs.com/dashboard"));
+    // A different page on the same host is not the success document.
+    CHECK(!TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("https://streamlabs.com/other?code=ABC"), "streamlabs.com/dashboard"));
+    // A lookalike host never matches.
+    CHECK(!TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("https://streamlabs.com.evil.com/dashboard?code=ABC"), "streamlabs.com/dashboard"));
+    // Other Streamlabs hosts are not part of the OAuth allowlist.
+    CHECK(!TikTokAuthUrl::IsExpectedExchangePage(
+        QUrl("https://ads.streamlabs.com/dashboard?code=ABC"), "ads.streamlabs.com/dashboard"));
+    // An empty expectation never matches.
+    CHECK(!TikTokAuthUrl::IsExpectedExchangePage(QUrl("https://streamlabs.com/dashboard"), ""));
+    return 0;
+}
+
+static int TestLogSafeForms(){
     // Query strings (code, verifier) must never appear in log output.
     CHECK(TikTokAuthUrl::LogSafeUrl(
               QUrl("https://streamlabs.com/dashboard?success=true&code=SECRET")) ==
@@ -180,6 +204,8 @@ int main()
     if (TestTikTokLoginDetection())
         return 1;
     if (TestLogSafeForms())
+        return 1;
+    if (TestExpectedExchangePage())
         return 1;
     if (TestLiveAccessApplyUrl())
         return 1;

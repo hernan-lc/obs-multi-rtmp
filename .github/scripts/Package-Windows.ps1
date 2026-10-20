@@ -102,6 +102,14 @@ function Package {
         throw "Installer source directory does not exist: ${InstallerSource}"
     }
 
+    # The WebView2 loader is part of the plugin: a package without it would
+    # ship a broken TikTok login.
+    $LoaderSource = Join-Path -Path $InstallerSource -ChildPath "bin/64bit/WebView2Loader.dll"
+    if ( ! ( Test-Path -LiteralPath $LoaderSource ) ) {
+        throw "WebView2Loader.dll is missing from the plugin layout: ${LoaderSource}"
+    }
+    Log-Information "WebView2 loader included: ${LoaderSource}"
+
     $InstallerSource = (Resolve-Path -LiteralPath $InstallerSource).ProviderPath
 
     Log-Information 'Creating NSIS installer...'

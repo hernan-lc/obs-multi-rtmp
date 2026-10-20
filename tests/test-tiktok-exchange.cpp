@@ -123,6 +123,23 @@ static int TestExchangePageFence()
     CHECK(fetchCall != std::string::npos);
     CHECK(pageCheck < fetchCall);
     CHECK(starter.find("window.__multirtmp_tiktok_exchange_seq", pageCheck) != std::string::npos);
+    // Plain HTTP is never an acceptable exchange document.
+    CHECK(starter.find("window.location.protocol !== 'https:'") != std::string::npos);
+    return 0;
+}
+
+static int TestPollPageFence()
+{
+    const std::string poll = BuildExchangePollJs("h/p");
+    // The poll script only reports a result on the expected document, so a
+    // result from an unrelated page can never be mistaken for the exchange.
+    CHECK(poll.find("if (P !== EP) return null;") != std::string::npos);
+    CHECK(poll.find("window.location.protocol !== 'https:'") != std::string::npos);
+    const size_t pageCheck = poll.find("if (P !== EP) return null;");
+    const size_t read = poll.find("window.__multirtmp_tiktok_exchange");
+    CHECK(pageCheck != std::string::npos);
+    CHECK(read != std::string::npos);
+    CHECK(pageCheck < read);
     return 0;
 }
 
@@ -143,6 +160,8 @@ int main(int argc, char **argv)
     if (TestScriptBuilders())
         return 1;
     if (TestExchangePageFence())
+        return 1;
+    if (TestPollPageFence())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;
