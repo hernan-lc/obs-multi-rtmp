@@ -38,7 +38,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Validate tag syntax
         id: version
         env:
@@ -72,12 +72,12 @@ jobs:
       SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
       MODE: ${{ inputs.mode || 'preserve' }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           path: source
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           github-token: ${{ github.token }}
@@ -85,7 +85,7 @@ jobs:
           pattern: obs-multi-rtmp-*
       - name: Validate and collect all packages
         run: python3 .github/scripts/release/release.py collect --tag "$TAG" --spec source/buildspec.json --sha "$SOURCE_SHA" --root artifacts
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: validated-release-${{ inputs.version }}
           path: release-assets/
@@ -106,7 +106,7 @@ jobs:
       - name: Verify destination tag and existing assets
         run: python3 .github/scripts/release/github.py preflight
       - name: Upload validated assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           token: ${{ env.GH_TOKEN }}
           repository: ${{ env.TARGET }}
