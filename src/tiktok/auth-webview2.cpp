@@ -12,7 +12,7 @@
 #include <windows.h>
 #include <objbase.h>
 #include <wrl/client.h>
-#include <wrl/functional.h>
+#include <wrl/event.h>
 
 #include <WebView2.h>
 

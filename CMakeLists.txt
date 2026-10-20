@@ -310,6 +310,7 @@ if(BUILD_TESTING)
     # Factory selection rules (platform preference, no silent downgrade).
     add_executable(test-tiktok-auth-browser-factory
       ./tests/test-tiktok-auth-browser-factory.cpp
+      ./src/tiktok/auth-browser.cpp
       ./src/tiktok/auth-browser-factory.cpp)
     target_include_directories(test-tiktok-auth-browser-factory PRIVATE ./src)
     target_link_libraries(test-tiktok-auth-browser-factory PRIVATE Qt6::Core)
@@ -319,7 +320,6 @@ if(BUILD_TESTING)
       # needed for linking.
       target_sources(test-tiktok-auth-browser-factory PRIVATE
         ./src/tiktok/auth-webengine.cpp
-        ./src/tiktok/auth-browser.cpp
         ./src/tiktok/auth-profile.cpp)
       target_compile_definitions(test-tiktok-auth-browser-factory PRIVATE WITH_TIKTOK_WEBENGINE=1)
       target_link_libraries(test-tiktok-auth-browser-factory PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
@@ -327,7 +327,6 @@ if(BUILD_TESTING)
     if(TIKTOK_HAVE_WEBVIEW2)
       target_sources(test-tiktok-auth-browser-factory PRIVATE
         ./src/tiktok/auth-webview2.cpp
-        ./src/tiktok/auth-browser.cpp
         ./src/tiktok/auth-profile.cpp
         ./src/tiktok/auth-jsvalue.cpp)
       target_compile_definitions(test-tiktok-auth-browser-factory PRIVATE WITH_TIKTOK_WEBVIEW2=1)
