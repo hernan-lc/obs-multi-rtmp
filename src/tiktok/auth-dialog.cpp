@@ -1,137 +1,22 @@
 #include "tiktok/auth-dialog.h"
+
 #include "tiktok/auth-browser.h"
-#include "tiktok/auth-url.h"
+#include "tiktok/auth-browser-factory.h"
+#include "tiktok/auth-profile.h"
 #include "tiktok/constants.h"
 
 #include <QLabel>
-#include <QStandardPaths>
+#include <QStackedWidget>
 #include <QVBoxLayout>
 
 #ifdef WITH_TIKTOK_WEBENGINE
 #include <QWebEngineCookieStore>
-#include <QWebEngineNewWindowRequest>
-#include <QWebEnginePage>
 #include <QWebEngineProfile>
-#include <QWebEngineSettings>
-#include <QWebEngineView>
-
-namespace {
-
-class HardenedPage : public QWebEnginePage {
-public:
-    using QWebEnginePage::QWebEnginePage;
-
-protected:
-    bool acceptNavigationRequest(const QUrl &url, NavigationType type, bool isMainFrame) override
-    {
-        Q_UNUSED(type);
-        // Never let the login browser touch local content.
-        if (isMainFrame && (url.scheme() == QStringLiteral("file"))) {
-            return false;
-        }
-        return QWebEnginePage::acceptNavigationRequest(url, type, isMainFrame);
-    }
-};
-
-class WebEngineBrowser : public TikTokAuthBrowser {
-public:
-    explicit WebEngineBrowser(QWidget *parent) : TikTokAuthBrowser(parent)
-    {
-        profile_ = new QWebEngineProfile(QString::fromLatin1(TikTokConstants::kWebViewProfileName),
-                                         this);
-        profile_->setPersistentStoragePath(TikTokAuthDialog::profileStoragePath());
-        profile_->setHttpUserAgent(QString::fromLatin1(TikTokConstants::kStreamlabsUserAgent));
-        profile_->setHttpCacheType(QWebEngineProfile::DiskHttpCache);
-        profile_->setPersistentCookiesPolicy(QWebEngineProfile::AllowPersistentCookies);
-
-        auto *settings = profile_->settings();
-        settings->setAttribute(QWebEngineSettings::JavascriptEnabled, true);
-        settings->setAttribute(QWebEngineSettings::LocalStorageEnabled, true);
-        settings->setAttribute(QWebEngineSettings::PluginsEnabled, false);
-        settings->setAttribute(QWebEngineSettings::FullScreenSupportEnabled, false);
-        settings->setAttribute(QWebEngineSettings::ScreenCaptureEnabled, false);
-        settings->setAttribute(QWebEngineSettings::PlaybackRequiresUserGesture, true);
-        settings->setAttribute(QWebEngineSettings::LocalContentCanAccessRemoteUrls, false);
-        settings->setAttribute(QWebEngineSettings::LocalContentCanAccessFileUrls, false);
-        settings->setAttribute(QWebEngineSettings::AllowRunningInsecureContent, false);
-
-        // Reject downloads: the login flow never needs them.
-        QObject::connect(profile_, &QWebEngineProfile::downloadRequested, this,
-                         [](QWebEngineDownloadRequest *download) {
-                             if (download)
-                                 download->cancel();
-                         });
-
-        page_ = new HardenedPage(profile_, this);
-        // Keep popup navigations in the same login view instead of
-        // spawning windows outside the hardened dialog.
-        QObject::connect(
-            page_, &QWebEnginePage::newWindowRequested, this,
-            [this](QWebEngineNewWindowRequest &request) { request.openIn(page_); });
-
-        view_ = new QWebEngineView(parent);
-        view_->setPage(page_);
-        view_->setContextMenuPolicy(Qt::NoContextMenu);
-
-        QObject::connect(view_, &QWebEngineView::urlChanged, this,
-                         [this](const QUrl &url) { emit urlObserved(url); });
-        QObject::connect(view_, &QWebEngineView::loadFinished, this, [this](bool ok) {
-            emit loadFinished(ok, view_ ? view_->url() : QUrl());
-        });
-    }
-
-    ~WebEngineBrowser() override
-    {
-        // Pages must be destroyed before their profile; the view belongs to the dialog.
-        delete view_;
-        delete page_;
-        delete profile_;
-    }
-
-    QUrl currentUrl() const override { return view_ ? view_->url() : QUrl(); }
-
-    void navigate(const QUrl &url) override
-    {
-        if (view_)
-            view_->setUrl(url);
-    }
-
-    void runJavaScript(const QString &code, std::function<void(const QVariant &)> callback) override
-    {
-        if (page_)
-            page_->runJavaScript(code, std::move(callback));
-        else if (callback)
-            callback(QVariant());
-    }
-
-    QWidget *widget() override { return view_; }
-
-    void clearSessionData() override
-    {
-        if (!profile_)
-            return;
-        profile_->cookieStore()->deleteAllCookies();
-        profile_->cookieStore()->deleteSessionCookies();
-        profile_->clearHttpCache();
-    }
-
-private:
-    QWebEngineProfile *profile_ = nullptr;
-    HardenedPage *page_ = nullptr;
-    QWebEngineView *view_ = nullptr;
-};
-
-} // namespace
-
-#endif // WITH_TIKTOK_WEBENGINE
+#endif
 
 QString TikTokAuthDialog::profileStoragePath()
 {
-    QString base = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
-    if (base.isEmpty())
-        base = QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
-    return base + QStringLiteral("/obs-studio/plugin_config/obs-multi-rtmp/") +
-           QString::fromLatin1(TikTokConstants::kWebViewDirName);
+    return TikTokAuthProfile::storagePath();
 }
 
 void TikTokAuthDialog::clearPersistentData()
@@ -144,13 +29,14 @@ void TikTokAuthDialog::clearPersistentData()
     profile.cookieStore()->deleteAllCookies();
     profile.cookieStore()->deleteSessionCookies();
     profile.clearHttpCache();
-#else
-    (void)0;
 #endif
+    // Remove the profile directory as well: cookies, cache and local
+    // storage must not survive a logout. Best effort, the browser process
+    // may still hold a few files for a short moment.
+    TikTokAuthProfile::clearStorage();
 }
 
-TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title)
-    : QDialog(parent)
+TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title) : QDialog(parent)
 {
     setWindowTitle(title.isEmpty() ? tr("Login with TikTok") : title);
     setModal(true);
@@ -159,27 +45,65 @@ TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
 
-#ifdef WITH_TIKTOK_WEBENGINE
-    auto *browser = new WebEngineBrowser(this);
-    browser_ = browser;
-    QObject::connect(browser_, &TikTokAuthBrowser::urlObserved, this,
-                     &TikTokAuthDialog::urlObserved);
-    QObject::connect(browser_, &TikTokAuthBrowser::loadFinished, this,
+    stack_ = new QStackedWidget(this);
+    notice_ = new QLabel(stack_);
+    notice_->setWordWrap(true);
+    notice_->setAlignment(Qt::AlignCenter);
+    notice_->setMargin(16);
+    stack_->addWidget(notice_);
+    layout->addWidget(stack_);
+
+    QString error;
+    browser_ = TikTokAuthBrowserFactory::create(this, &error);
+    if (!browser_) {
+        notice_->setText(error.isEmpty()
+                             ? tr("The embedded TikTok login browser is not available in this build.")
+                             : error);
+        setLayout(layout);
+        return;
+    }
+    QObject::connect(browser_.get(), &TikTokAuthBrowser::urlObserved, this, &TikTokAuthDialog::urlObserved);
+    QObject::connect(browser_.get(), &TikTokAuthBrowser::loadFinished, this,
                      &TikTokAuthDialog::pageLoadFinished);
-    layout->addWidget(browser->widget());
-#else
-    auto *notice =
-        new QLabel(tr("The embedded TikTok login browser (Qt WebEngine) is not available in this "
-                      "build. Please use a packaged build with WebEngine support."),
-                   this);
-    notice->setWordWrap(true);
-    notice->setMargin(16);
-    layout->addWidget(notice);
-#endif
+    QObject::connect(browser_.get(), &TikTokAuthBrowser::ready, this, [this]() {
+        notice_->setText(tr("Starting the embedded login browser..."));
+        if (stack_->count() > 1)
+            stack_->setCurrentIndex(1);
+        emit browserReady();
+    });
+    QObject::connect(browser_.get(), &TikTokAuthBrowser::failed, this, [this](const QString &message) {
+        notice_->setText(message.isEmpty()
+                             ? tr("The embedded TikTok login browser could not be started.")
+                             : message);
+        stack_->setCurrentIndex(0);
+        emit browserFailed(message);
+    });
+
+    notice_->setText(tr("Starting the embedded login browser..."));
+    stack_->addWidget(browser_->widget());
     setLayout(layout);
+
+    // The backend initializes asynchronously; the first navigation is
+    // queued by the browser until it is ready.
+    browser_->initialize();
 }
 
-TikTokAuthDialog::~TikTokAuthDialog() = default;
+TikTokAuthDialog::~TikTokAuthDialog()
+{
+    // Release the browser (and with it the native browser resources) while
+    // the host widgets are still alive.
+    browser_.reset();
+}
+
+bool TikTokAuthDialog::isBrowserReady() const
+{
+    return browser_ != nullptr && browser_->isReady();
+}
+
+QString TikTokAuthDialog::browserBackendName() const
+{
+    return browser_ ? browser_->backendName() : QString();
+}
 
 QUrl TikTokAuthDialog::currentUrl() const
 {
@@ -192,7 +116,8 @@ void TikTokAuthDialog::navigate(const QUrl &url)
         browser_->navigate(url);
 }
 
-void TikTokAuthDialog::runJavaScript(const QString &code, std::function<void(const QVariant &)> callback)
+void TikTokAuthDialog::runJavaScript(const QString &code,
+                                     std::function<void(const QVariant &)> callback)
 {
     if (browser_)
         browser_->runJavaScript(code, std::move(callback));

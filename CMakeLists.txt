@@ -6,8 +6,10 @@ project(${_name} VERSION ${_version})
 
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
-set(ENABLE_TIKTOK_LOGIN "ON" CACHE STRING "Embedded TikTok login: ON, OFF, or AUTO when WebEngine is available")
+set(ENABLE_TIKTOK_LOGIN "ON" CACHE STRING "Embedded TikTok login: ON, OFF, or AUTO when a browser backend is available")
 set_property(CACHE ENABLE_TIKTOK_LOGIN PROPERTY STRINGS ON OFF AUTO)
+set(TIKTOK_BROWSER_BACKEND "auto" CACHE STRING "TikTok login browser backend: auto, webview2, qtwebengine or none")
+set_property(CACHE TIKTOK_BROWSER_BACKEND PROPERTY STRINGS auto webview2 qtwebengine none)
 
 include(compilerconfig)
 include(defaults)
@@ -50,22 +52,94 @@ endif()
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
-  # OBS dependency bundles do not always include WebEngine. AUTO uses
-  # the existing unavailable-browser UI; ON still requires WebEngine.
-  if(ENABLE_TIKTOK_LOGIN)
-    if(ENABLE_TIKTOK_LOGIN STREQUAL "AUTO")
-      find_package(Qt6 QUIET COMPONENTS WebEngineCore WebEngineWidgets)
-    else()
+
+  # ---------------------------------------------------------------------------
+  # TikTok login browser backend
+  #
+  # The embedded login needs a browser backend. Windows uses the native
+  # Microsoft Edge WebView2 (no Qt WebEngine runtime required), Linux and
+  # macOS use Qt WebEngine. ENABLE_TIKTOK_LOGIN decides whether a missing
+  # backend is a configuration error (ON) or only a warning (AUTO).
+  # ---------------------------------------------------------------------------
+  if(NOT TIKTOK_BROWSER_BACKEND MATCHES "^(auto|webview2|qtwebengine|none)$")
+    message(FATAL_ERROR "obs-multi-rtmp: invalid TIKTOK_BROWSER_BACKEND='${TIKTOK_BROWSER_BACKEND}' (expected auto, webview2, qtwebengine or none)")
+  endif()
+
+  set(TIKTOK_BROWSER_BACKEND_SELECTED "none")
+  set(TIKTOK_HAVE_WEBENGINE OFF)
+  set(TIKTOK_HAVE_WEBVIEW2 OFF)
+
+  if(NOT ENABLE_TIKTOK_LOGIN STREQUAL "OFF")
+    if(TIKTOK_BROWSER_BACKEND STREQUAL "none")
+      set(TIKTOK_BROWSER_BACKEND_SELECTED "none")
+    elseif(TIKTOK_BROWSER_BACKEND STREQUAL "qtwebengine")
       find_package(Qt6 REQUIRED COMPONENTS WebEngineCore WebEngineWidgets)
+      set(TIKTOK_HAVE_WEBENGINE ON)
+      set(TIKTOK_BROWSER_BACKEND_SELECTED "qtwebengine")
+    elseif(TIKTOK_BROWSER_BACKEND STREQUAL "webview2")
+      if(NOT WIN32)
+        message(FATAL_ERROR "obs-multi-rtmp: TIKTOK_BROWSER_BACKEND=webview2 is only supported on Windows")
+      endif()
+      include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/webview2.cmake")
+      tiktok_setup_webview2()
+      if(NOT TIKTOK_WEBVIEW2_FOUND)
+        message(FATAL_ERROR "obs-multi-rtmp: the Microsoft.Web.WebView2 ${TIKTOK_WEBVIEW2_VERSION} SDK could not be acquired")
+      endif()
+      set(TIKTOK_HAVE_WEBVIEW2 ON)
+      set(TIKTOK_BROWSER_BACKEND_SELECTED "webview2")
+    else()
+      # auto: prefer the native Windows backend, fall back to Qt WebEngine.
+      if(WIN32)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/webview2.cmake")
+        tiktok_setup_webview2()
+        if(TIKTOK_WEBVIEW2_FOUND)
+          set(TIKTOK_HAVE_WEBVIEW2 ON)
+          set(TIKTOK_BROWSER_BACKEND_SELECTED "webview2")
+        endif()
+      endif()
+      if(TIKTOK_BROWSER_BACKEND_SELECTED STREQUAL "none")
+        find_package(Qt6 QUIET COMPONENTS WebEngineCore WebEngineWidgets)
+        if(TARGET Qt6::WebEngineCore AND TARGET Qt6::WebEngineWidgets)
+          set(TIKTOK_HAVE_WEBENGINE ON)
+          set(TIKTOK_BROWSER_BACKEND_SELECTED "qtwebengine")
+        endif()
+      endif()
     endif()
   endif()
-  if(ENABLE_TIKTOK_LOGIN AND TARGET Qt6::WebEngineCore AND TARGET Qt6::WebEngineWidgets)
+
+  if(TIKTOK_HAVE_WEBENGINE)
     target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
     target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WITH_TIKTOK_WEBENGINE=1)
-    message(STATUS "obs-multi-rtmp: embedded TikTok login enabled")
-  else()
-    message(STATUS "obs-multi-rtmp: embedded TikTok login disabled (ENABLE_TIKTOK_LOGIN=${ENABLE_TIKTOK_LOGIN}; WebEngine may be unavailable)")
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE ./src/tiktok/auth-webengine.h ./src/tiktok/auth-webengine.cpp)
   endif()
+
+  if(TIKTOK_HAVE_WEBVIEW2)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${TIKTOK_WEBVIEW2_INCLUDE_DIR})
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "${TIKTOK_WEBVIEW2_LIBRARY}" ole32 uuid)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE WITH_TIKTOK_WEBVIEW2=1)
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE ./src/tiktok/auth-webview2.h ./src/tiktok/auth-webview2.cpp)
+    # The loader ships next to the plugin; OBS loads plugins with an altered
+    # search path, so the plugin directory is searched first.
+    install(FILES "${TIKTOK_WEBVIEW2_RUNTIME}" DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
+    add_custom_command(
+      TARGET ${CMAKE_PROJECT_NAME}
+      POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${TIKTOK_WEBVIEW2_RUNTIME}" "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>"
+      COMMENT "Copy WebView2Loader next to the plugin"
+      VERBATIM
+    )
+  endif()
+
+  if(TIKTOK_BROWSER_BACKEND_SELECTED STREQUAL "none")
+    if(ENABLE_TIKTOK_LOGIN STREQUAL "ON")
+      message(FATAL_ERROR "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN=ON requires a TikTok login browser backend, but none could be configured (TIKTOK_BROWSER_BACKEND=${TIKTOK_BROWSER_BACKEND})")
+    else()
+      message(WARNING "obs-multi-rtmp: embedded TikTok login disabled (no browser backend available; TIKTOK_BROWSER_BACKEND=${TIKTOK_BROWSER_BACKEND})")
+    endif()
+  else()
+    message(STATUS "obs-multi-rtmp: embedded TikTok login enabled (browser backend: ${TIKTOK_BROWSER_BACKEND_SELECTED})")
+  endif()
+
   target_compile_options(
     ${CMAKE_PROJECT_NAME}
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
@@ -76,7 +150,7 @@ if(ENABLE_QT)
   )
 endif()
 
-if(NOT ENABLE_QT AND ENABLE_TIKTOK_LOGIN)
+if(NOT ENABLE_QT AND NOT ENABLE_TIKTOK_LOGIN STREQUAL "OFF")
   message(WARNING "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN requires ENABLE_QT; embedded login will be unavailable")
 endif()
 
@@ -116,6 +190,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   ./src/tiktok/auth-flow.h
   ./src/tiktok/auth-flow.cpp
   ./src/tiktok/auth-browser.h
+  ./src/tiktok/auth-browser.cpp
+  ./src/tiktok/auth-browser-factory.h
+  ./src/tiktok/auth-browser-factory.cpp
+  ./src/tiktok/auth-profile.h
+  ./src/tiktok/auth-profile.cpp
+  ./src/tiktok/auth-jsvalue.h
+  ./src/tiktok/auth-jsvalue.cpp
   ./src/tiktok/auth-dialog.h
   ./src/tiktok/auth-dialog.cpp
   ./src/tiktok/auth-manager.h
@@ -211,7 +292,7 @@ endif()
 # without the embedded browser or an authenticated account.
 if(BUILD_TESTING AND ENABLE_QT AND ENABLE_FRONTEND_API)
   get_target_property(_lifecycle_sources ${CMAKE_PROJECT_NAME} SOURCES)
-  list(FILTER _lifecycle_sources EXCLUDE REGEX "push-widget\\.(cpp|h)$|streamlabs-client\\.cpp$")
+  list(FILTER _lifecycle_sources EXCLUDE REGEX "push-widget\\.(cpp|h)$|streamlabs-client\\.cpp$|auth-webengine\\.(cpp|h)$|auth-webview2\\.(cpp|h)$")
   add_executable(test-tiktok-lifecycle ./tests/test-tiktok-lifecycle.cpp ${_lifecycle_sources})
   get_target_property(_lifecycle_includes ${CMAKE_PROJECT_NAME} INCLUDE_DIRECTORIES)
   target_include_directories(test-tiktok-lifecycle PRIVATE ${_lifecycle_includes})
@@ -233,7 +314,7 @@ if(BUILD_TESTING AND ENABLE_QT AND ENABLE_FRONTEND_API)
   # unavailable, e.g. display-less CI. Run with a display for GL:
   # DISPLAY=:0 ctest -R tiktok-standalone
   get_target_property(_standalone_sources ${CMAKE_PROJECT_NAME} SOURCES)
-  list(FILTER _standalone_sources EXCLUDE REGEX "push-widget\\.(cpp|h)$|streamlabs-client\\.cpp$")
+  list(FILTER _standalone_sources EXCLUDE REGEX "push-widget\\.(cpp|h)$|streamlabs-client\\.cpp$|auth-webengine\\.(cpp|h)$|auth-webview2\\.(cpp|h)$")
   add_executable(test-tiktok-standalone ./tests/test-tiktok-standalone.cpp ${_standalone_sources})
   get_target_property(_standalone_includes ${CMAKE_PROJECT_NAME} INCLUDE_DIRECTORIES)
   target_include_directories(test-tiktok-standalone PRIVATE ${_standalone_includes})

@@ -9,12 +9,16 @@ const fetch = () => {
   ++calls;
   return new Promise(resolve => { resolveFetch = resolve; });
 };
-const document = (host, pathname) => vm.createContext({
-  window: { location: { host, pathname } }, fetch,
+const document = (host, pathname, protocol = 'https:') => vm.createContext({
+  window: { location: { host, pathname, protocol } }, fetch,
 });
 (async () => {
   const stale = document('www.tiktok.com', '/login');
   assert.equal(vm.runInContext(script, stale), 'wrong-page');
+  assert.equal(calls, 0);
+  // Plain HTTP is never an acceptable exchange document.
+  const insecure = document('streamlabs.com', '/dashboard', 'http:');
+  assert.equal(vm.runInContext(script, insecure), 'wrong-page');
   assert.equal(calls, 0);
   const committed = document('streamlabs.com', '/dashboard');
   assert.equal(vm.runInContext(script, committed), 'started');

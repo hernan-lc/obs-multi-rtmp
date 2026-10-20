@@ -81,6 +81,19 @@ QString SuccessPageId(const QUrl &url)
     return host + url.path();
 }
 
+bool IsExpectedExchangePage(const QUrl &url, const QString &expectedPage)
+{
+    if (expectedPage.isEmpty())
+        return false;
+    // The exchange runs privileged JavaScript: only an HTTPS document on
+    // the OAuth allowlist may ever carry it.
+    if (url.scheme().compare(QStringLiteral("https"), Qt::CaseInsensitive) != 0)
+        return false;
+    if (!IsOAuthHost(url))
+        return false;
+    return SuccessPageId(url) == expectedPage;
+}
+
 bool IsLiveAccessResultUrl(const QUrl &url)
 {
     if (!IsTikTokUrl(url))

@@ -80,7 +80,11 @@ public:
 
     bool secureStorageAvailable() const;
     bool secureStoragePersistent() const;
-    bool webEngineAvailable() const;
+    // True when a browser backend for the interactive login is compiled in
+    // (Qt WebEngine or the native Edge WebView2).
+    bool browserAvailable() const;
+    // Name of the browser backend that would be used, for logs and errors.
+    QString browserBackendName() const;
 
     // Loads the stored credential and validates it with GET /info:
     // valid -> authenticated; 401/403 -> credential removed; network or
@@ -153,6 +157,11 @@ private:
     void pollExchange(uint64_t attempt);
     void onDialogUrl(uint64_t attempt, const QUrl &url);
     void onDialogLoad(uint64_t attempt, bool ok, const QUrl &url);
+    // Browser backend lifecycle: the navigation only starts once the
+    // backend finished its asynchronous initialization.
+    void onBrowserReady(uint64_t attempt);
+    void onBrowserFailed(uint64_t attempt, const QString &error);
+    void startUrlPolling(uint64_t attempt);
     void stopLoginTimers();
     void teardownDialog();
     void scrubDialogSession();

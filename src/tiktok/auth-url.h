@@ -51,6 +51,11 @@ std::optional<QString> ExtractAuthorizationCode(const QUrl &url);
 // the expected Streamlabs success document.
 QString SuccessPageId(const QUrl &url);
 
+// True when the URL is the expected exchange document: an HTTPS page on
+// the OAuth allowlist whose host + path matches the expected page id.
+// The privileged token exchange script may only run on such a page.
+bool IsExpectedExchangePage(const QUrl &url, const QString &expectedPage);
+
 // True for TikTok's official LIVE-access application result page.
 // Used only to notice, in our own embedded browser, that the user
 // reached the result step (drives the pending state + auto-close).

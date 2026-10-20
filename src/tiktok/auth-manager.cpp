@@ -16,6 +16,7 @@
 
 #include "output-config.h"
 #include "streamlabs-tiktok.h"
+#include "tiktok/auth-browser-factory.h"
 #include "tiktok/auth-dialog.h"
 #include "tiktok/auth-flow.h"
 #include "tiktok/auth-url.h"
@@ -176,13 +177,14 @@ bool TikTokAuthManager::secureStoragePersistent() const
     return activeStore_ != nullptr && activeStore_->isPersistent();
 }
 
-bool TikTokAuthManager::webEngineAvailable() const
+bool TikTokAuthManager::browserAvailable() const
 {
-#ifdef WITH_TIKTOK_WEBENGINE
-    return true;
-#else
-    return false;
-#endif
+    return TikTokAuthBrowserFactory::isAvailable();
+}
+
+QString TikTokAuthManager::browserBackendName() const
+{
+    return TikTokAuthBrowserFactory::backendName();
 }
 
 void TikTokAuthManager::setStatus(Status status)
@@ -416,8 +418,9 @@ void TikTokAuthManager::login(QWidget *parent)
             return;
         }
     }
-    if (!webEngineAvailable()) {
-        emit loginFailed(QString::fromUtf8(obs_module_text("TikTok.WebEngineUnavailable")));
+    if (!browserAvailable()) {
+        blog(LOG_WARNING, TAG "TikTok: no login browser backend in this build");
+        emit loginFailed(QString::fromUtf8(obs_module_text("TikTok.BrowserUnavailable")));
         return;
     }
 
@@ -442,13 +445,17 @@ void TikTokAuthManager::login(QWidget *parent)
     dialog_ = new TikTokAuthDialog(parent);
     if (!dialog_->browserAvailable()) {
         finishLoginAttempt(attempt,
-                           QString::fromUtf8(obs_module_text("TikTok.WebEngineUnavailable")));
+                           QString::fromUtf8(obs_module_text("TikTok.BrowserUnavailable")));
         return;
     }
     QObject::connect(dialog_, &TikTokAuthDialog::urlObserved, this,
                      [this, attempt](const QUrl &url) { onDialogUrl(attempt, url); });
     QObject::connect(dialog_, &TikTokAuthDialog::pageLoadFinished, this,
                      [this, attempt](bool ok, const QUrl &url) { onDialogLoad(attempt, ok, url); });
+    QObject::connect(dialog_, &TikTokAuthDialog::browserReady, this,
+                     [this, attempt]() { onBrowserReady(attempt); });
+    QObject::connect(dialog_, &TikTokAuthDialog::browserFailed, this,
+                     [this, attempt](const QString &error) { onBrowserFailed(attempt, error); });
     QObject::connect(dialog_, &QDialog::rejected, this, [this, attempt]() {
         // Dialog closed: cancel only if this attempt is still active.
         std::lock_guard<std::mutex> lock(mutex_);
@@ -471,6 +478,49 @@ void TikTokAuthManager::login(QWidget *parent)
 
     lastPolledUrl_ = QUrl();
     authUrlPollInProgress_ = false;
+
+    // The backend initializes asynchronously. Some backends are ready
+    // before the caller can connect (the signal is emitted inside the
+    // dialog constructor), so the ready state is checked explicitly.
+    if (dialog_->isBrowserReady())
+        onBrowserReady(attempt);
+
+    dialog_->show();
+}
+
+void TikTokAuthManager::onBrowserReady(uint64_t attempt)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!loginActive_ || attempt != loginAttempt_ || !dialog_)
+            return;
+    }
+    if (authUrlPollTimer_)
+        return; // already running for this attempt
+    blog(LOG_INFO, TAG "[TikTokAuth] Browser ready (%s)",
+         qPrintable(dialog_->browserBackendName()));
+    startUrlPolling(attempt);
+    dialog_->navigate(QUrl(QString::fromLatin1(TikTokConstants::kTikTokLoginUrl)));
+}
+
+void TikTokAuthManager::onBrowserFailed(uint64_t attempt, const QString &error)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!loginActive_ || attempt != loginAttempt_)
+            return;
+    }
+    blog(LOG_WARNING, TAG "[TikTokAuth] Browser backend failed");
+    const QString message = error.isEmpty()
+                                 ? QString::fromUtf8(obs_module_text("TikTok.BrowserInitFailed"))
+                                 : error;
+    finishLoginAttempt(attempt, message);
+}
+
+void TikTokAuthManager::startUrlPolling(uint64_t attempt)
+{
+    if (authUrlPollTimer_)
+        return;
     authUrlPollTimer_ = new QTimer(this);
     authUrlPollTimer_->setInterval(1500);
     QObject::connect(authUrlPollTimer_, &QTimer::timeout, this, [this, attempt]() {
@@ -498,10 +548,6 @@ void TikTokAuthManager::login(QWidget *parent)
             });
     });
     authUrlPollTimer_->start();
-    blog(LOG_INFO, TAG "[TikTokAuth] Browser opened");
-
-    dialog_->navigate(QUrl(QString::fromLatin1(TikTokConstants::kTikTokLoginUrl)));
-    dialog_->show();
 }
 
 void TikTokAuthManager::cancelLogin()
@@ -523,7 +569,7 @@ void TikTokAuthManager::openLiveAccessApplication(QWidget *parent)
         applyDialog_->raise();
         return;
     }
-    if (!webEngineAvailable()) {
+    if (!browserAvailable()) {
         // Help link only (not a credential flow), so the external
         // browser is an acceptable fallback here.
         QDesktopServices::openUrl(QUrl(QString::fromLatin1(TikTokConstants::kLiveAccessApplyUrl)));
@@ -876,6 +922,13 @@ void TikTokAuthManager::onDialogUrl(uint64_t attempt, const QUrl &url)
         });
         break;
     case TikTokAuthFlow::NavAction::Exchange:
+        // The token exchange runs privileged JavaScript in the page: it is
+        // only ever executed on the expected HTTPS Streamlabs success
+        // document, never on an arbitrary page.
+        if (!TikTokAuthUrl::IsExpectedExchangePage(url, flow_->exchangePage())) {
+            blog(LOG_WARNING, TAG "[TikTokAuth] Rejected token exchange on unexpected page");
+            return;
+        }
         blog(LOG_INFO, TAG "[TikTokAuth] Authorization code detected; token exchange started");
         startExchange(attempt, code, flow_->exchangePage());
         break;

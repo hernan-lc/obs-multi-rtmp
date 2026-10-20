@@ -83,6 +83,7 @@ std::string BuildExchangeStartJs(const std::string &exchangeUrl, const std::stri
     js += "  var EP = " + pageJson + ";\n";
     js += "  var P = window.location.host + window.location.pathname;\n";
     js += "  if (P !== EP) return 'wrong-page';\n";
+    js += "  if (window.location.protocol !== 'https:') return 'wrong-page';\n";
     js += "  var r = window.__multirtmp_tiktok_exchange;\n";
     js += "  if (r != null && (r.page === EP || r.success === true)) return 'kept';\n";
     js += "  if (window.__multirtmp_tiktok_exchange_inflight) return 'in-progress';\n";
@@ -126,10 +127,14 @@ std::string BuildExchangePollJs(const std::string &expectedPage)
     const std::string pageJson = JsonEscape(expectedPage);
     std::string js;
     js += "(function() {\n";
+    js += "  var EP = " + pageJson + ";\n";
+    js += "  var P = window.location.host + window.location.pathname;\n";
+    js += "  if (P !== EP) return null;\n";
+    js += "  if (window.location.protocol !== 'https:') return null;\n";
     js += "  var r = window.__multirtmp_tiktok_exchange;\n";
     js += "  if (r == null) return null;\n";
     js += "  if (r.success === true) return r;\n";
-    js += "  if (r.page === " + pageJson + ") return r;\n";
+    js += "  if (r.page === EP) return r;\n";
     js += "  return null;\n";
     js += "})()";
     return js;
