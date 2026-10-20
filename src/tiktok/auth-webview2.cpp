@@ -102,7 +102,9 @@ struct TikTokWebView2Browser::Impl {
             shared->webview->remove_SourceChanged(shared->sourceChanged);
             shared->webview->remove_NewWindowRequested(shared->newWindowRequested);
             shared->webview->remove_ProcessFailed(shared->processFailed);
-            shared->webview->remove_DownloadStarting(shared->downloadStarting);
+            ComPtr<ICoreWebView2_4> webview4;
+            if (SUCCEEDED(shared->webview.As(&webview4)) && webview4)
+                webview4->remove_DownloadStarting(shared->downloadStarting);
             shared->webview->remove_PermissionRequested(shared->permissionRequested);
             shared->handlersRegistered = false;
         }
@@ -209,10 +211,10 @@ void TikTokWebView2Browser::initialize()
         reinterpret_cast<LPCWSTR>(impl_->shared->userDataDir.utf16()),
         nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [weak, host](HRESULT envResult, ICoreWebView2Environment *environment) {
+            [weak, host](HRESULT envResult, ICoreWebView2Environment *environment) -> HRESULT {
                 auto shared = weak.lock();
                 if (!shared || shared->shuttingDown.load())
-                    return;
+                    return S_OK;
                 if (FAILED(envResult) || environment == nullptr) {
                     QString message;
                     if (envResult == kRuntimeMissing) {
@@ -222,7 +224,7 @@ void TikTokWebView2Browser::initialize()
                     }
                     if (auto browser = shared->browser)
                         browser->notifyFailed(message);
-                    return;
+                    return S_OK;
                 }
 
                 shared->environment = environment;
@@ -232,21 +234,22 @@ void TikTokWebView2Browser::initialize()
                         host,
                         Microsoft::WRL::Callback<
                             ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                            [weak](HRESULT ctlResult, ICoreWebView2Controller *ctl) {
+                            [weak](HRESULT ctlResult, ICoreWebView2Controller *ctl) -> HRESULT {
                                 auto state = weak.lock();
                                 if (!state || state->shuttingDown.load())
-                                    return;
+                                    return S_OK;
                                 if (FAILED(ctlResult) || ctl == nullptr) {
                                     if (auto browser = state->browser) {
                                         browser->notifyFailed(
                                             QString::fromUtf8(obs_module_text(
                                                 "TikTok.BrowserInitFailed")));
                                     }
-                                    return;
+                                    return S_OK;
                                 }
                                 state->controller = ctl;
                                 if (auto browser = state->browser)
                                     browser->notifyControllerReady();
+                                return S_OK;
                             })
                             .Get());
                 if (FAILED(controllerResult)) {
@@ -255,6 +258,7 @@ void TikTokWebView2Browser::initialize()
                             obs_module_text("TikTok.BrowserInitFailed")));
                     }
                 }
+                return S_OK;
             })
             .Get());
 
@@ -335,10 +339,10 @@ void TikTokWebView2Browser::registerEventHandlers()
 
     shared->webview->add_NavigationStarting(
         Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-            [weak](ICoreWebView2NavigationStartingEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 LPWSTR uri = nullptr;
                 args->get_Uri(&uri);
                 const QUrl url(FromWide(uri));
@@ -348,25 +352,27 @@ void TikTokWebView2Browser::registerEventHandlers()
                     // Local content and script URLs are never part of the
                     // login flow.
                     args->put_Cancel(TRUE);
-                    return;
+                    return S_OK;
                 }
                 if (auto browser = state->browser)
                     browser->handleNavigationStarting(url);
+                return S_OK;
             })
             .Get(),
         &shared->navigationStarting);
 
     shared->webview->add_NavigationCompleted(
         Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-            [weak](ICoreWebView2NavigationCompletedEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2NavigationCompletedEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 BOOL success = FALSE;
                 args->get_IsSuccess(&success);
                 const QUrl url = state->browser ? state->browser->currentUrl() : QUrl();
                 if (auto browser = state->browser)
                     browser->handleLoadFinished(success != FALSE, url);
+                return S_OK;
             })
             .Get(),
         &shared->navigationCompleted);
@@ -375,27 +381,29 @@ void TikTokWebView2Browser::registerEventHandlers()
     // source change event reports those updates.
     shared->webview->add_SourceChanged(
         Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
-            [weak](ICoreWebView2SourceChangedEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2SourceChangedEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 LPWSTR source = nullptr;
-                args->get_Source(&source);
+                if (!state->webview || FAILED(state->webview->get_Source(&source)))
+                    return S_OK;
                 const QUrl url(FromWide(source));
                 if (source)
                     CoTaskMemFree(source);
                 if (auto browser = state->browser)
                     browser->handleSourceChanged(url);
+                return S_OK;
             })
             .Get(),
         &shared->sourceChanged);
 
     shared->webview->add_NewWindowRequested(
         Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-            [weak](ICoreWebView2NewWindowRequestedEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2NewWindowRequestedEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 // Popups stay inside the login window: the plugin never
                 // opens an unmanaged browser window.
                 args->put_Handled(TRUE);
@@ -408,46 +416,53 @@ void TikTokWebView2Browser::registerEventHandlers()
                     !IsBlockedScheme(url)) {
                     state->webview->Navigate(reinterpret_cast<LPCWSTR>(url.toString().utf16()));
                 }
+                return S_OK;
             })
             .Get(),
         &shared->newWindowRequested);
 
     shared->webview->add_ProcessFailed(
         Microsoft::WRL::Callback<ICoreWebView2ProcessFailedEventHandler>(
-            [weak](ICoreWebView2ProcessFailedEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2ProcessFailedEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 COREWEBVIEW2_PROCESS_FAILED_KIND kind = COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
                 args->get_ProcessFailedKind(&kind);
                 if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED) {
                     if (auto browser = state->browser)
                         browser->handleProcessFailed();
                 }
+                return S_OK;
             })
             .Get(),
         &shared->processFailed);
 
-    // The login flow never downloads anything.
-    shared->webview->add_DownloadStarting(
-        Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
-            [weak](ICoreWebView2DownloadStartingEventArgs *args) {
-                auto state = weak.lock();
-                if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
-                args->put_Cancel(TRUE);
-            })
-            .Get(),
-        &shared->downloadStarting);
+    // Download events were added in ICoreWebView2_4; query runtime support.
+    ComPtr<ICoreWebView2_4> webview4;
+    if (SUCCEEDED(shared->webview.As(&webview4)) && webview4) {
+        webview4->add_DownloadStarting(
+            Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
+                [weak](ICoreWebView2 *, ICoreWebView2DownloadStartingEventArgs *args) -> HRESULT {
+                    auto state = weak.lock();
+                    if (!state || state->shuttingDown.load() || args == nullptr)
+                        return S_OK;
+                    args->put_Cancel(TRUE);
+                    return S_OK;
+                })
+                .Get(),
+                &shared->downloadStarting);
+    }
 
     // Deny every permission request (camera, microphone, geolocation, ...).
     shared->webview->add_PermissionRequested(
         Microsoft::WRL::Callback<ICoreWebView2PermissionRequestedEventHandler>(
-            [weak](ICoreWebView2PermissionRequestedEventArgs *args) {
+            [weak](ICoreWebView2 *, ICoreWebView2PermissionRequestedEventArgs *args) -> HRESULT {
                 auto state = weak.lock();
                 if (!state || state->shuttingDown.load() || args == nullptr)
-                    return;
+                    return S_OK;
                 args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                return S_OK;
             })
             .Get(),
         &shared->permissionRequested);
@@ -458,20 +473,20 @@ void TikTokWebView2Browser::registerEventHandlers()
     if (SUCCEEDED(shared->webview.As(&webview2)) && webview2) {
         webview2->add_WebResourceRequested(
             Microsoft::WRL::Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-                [weak](ICoreWebView2WebResourceRequestedEventArgs *args) {
+                [weak](ICoreWebView2 *, ICoreWebView2WebResourceRequestedEventArgs *args) -> HRESULT {
                     auto state = weak.lock();
                     if (!state || state->shuttingDown.load() || args == nullptr)
-                        return;
+                        return S_OK;
                     ComPtr<ICoreWebView2WebResourceRequest> request;
                     if (FAILED(args->get_Request(request.GetAddressOf())) || !request)
-                        return;
+                        return S_OK;
                     LPWSTR uri = nullptr;
                     request->get_Uri(&uri);
                     const QUrl url(FromWide(uri));
                     if (uri)
                         CoTaskMemFree(uri);
                     if (!IsBlockedScheme(url))
-                        return;
+                        return S_OK;
                     // Answer with an empty 404 instead of the local file.
                     ComPtr<ICoreWebView2WebResourceResponse> response;
                     if (state->environment &&
@@ -480,6 +495,7 @@ void TikTokWebView2Browser::registerEventHandlers()
                             response.GetAddressOf()))) {
                         args->put_Response(response.Get());
                     }
+                    return S_OK;
                 })
             .Get(),
             &shared->webResourceRequested);
@@ -551,16 +567,16 @@ void TikTokWebView2Browser::runJavaScript(const QString &code,
     const HRESULT result = shared->webview->ExecuteScript(
         script.c_str(),
         Microsoft::WRL::Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
-            [callback](HRESULT errorCode, BSTR json) {
+            [callback](HRESULT errorCode, LPCWSTR json) -> HRESULT {
                 QVariant value;
                 if (SUCCEEDED(errorCode) && json != nullptr) {
-                    // WebView2 returns the JSON serialization of the result.
+                    // The JSON string belongs to WebView2 and is valid only
+                    // for the duration of this callback.
                     value = TikTokAuthJsValue::JsonToVariant(QString::fromWCharArray(json));
                 }
-                if (json != nullptr)
-                    SysFreeString(json);
                 if (callback)
                     callback(value);
+                return S_OK;
             })
             .Get());
 
@@ -597,12 +613,13 @@ void TikTokWebView2Browser::clearSessionData()
                 auto strong = shared;
                 const HRESULT result = profile2->ClearBrowsingDataAll(
                     Microsoft::WRL::Callback<ICoreWebView2ClearBrowsingDataCompletedHandler>(
-                        [strong](HRESULT) {
+                        [strong](HRESULT) -> HRESULT {
                             strong->cleanupPending = false;
                             if (strong->releaseDeferred) {
                                 strong->releaseDeferred = false;
                                 Impl::ReleaseComObjects(strong);
                             }
+                            return S_OK;
                         })
                         .Get());
                 if (SUCCEEDED(result))
@@ -614,7 +631,9 @@ void TikTokWebView2Browser::clearSessionData()
 
     // Fallback for older runtimes: drop the cookies at least.
     ComPtr<ICoreWebView2CookieManager> cookies;
-    if (SUCCEEDED(shared->webview->get_CookieManager(cookies.GetAddressOf())) && cookies)
+    ComPtr<ICoreWebView2_2> webview2;
+    if (SUCCEEDED(shared->webview.As(&webview2)) && webview2 &&
+        SUCCEEDED(webview2->get_CookieManager(cookies.GetAddressOf())) && cookies)
         cookies->DeleteAllCookies();
 }
 
