@@ -162,7 +162,7 @@ the Windows login working.
 
 Automated (run in this branch; see commands above): all 14 ctest suites pass,
 including the extended `test-tiktok-lifecycle` checks listed above, on Linux
-with system libobs 30 / Qt 6.12 (repo targets OBS 32.2.1; API used here is
+with system libobs 30 / Qt 6.12 (repo targets OBS 32.2.2; API used here is
 stable across both).
 
 Manual (requires a real OBS install and, where noted, a TikTok account):
