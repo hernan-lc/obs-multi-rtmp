@@ -1,5 +1,7 @@
 #include "tiktok/auth-dialog.h"
 
+#include "obs-module.h"
+
 #include "tiktok/auth-browser.h"
 #include "tiktok/auth-browser-factory.h"
 #include "tiktok/auth-profile.h"
@@ -57,7 +59,7 @@ TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title) : QDia
     browser_ = TikTokAuthBrowserFactory::create(this, &error);
     if (!browser_) {
         notice_->setText(error.isEmpty()
-                             ? tr("The embedded TikTok login browser is not available in this build.")
+                             ? QString::fromUtf8(obs_module_text("TikTok.BrowserUnavailable"))
                              : error);
         setLayout(layout);
         return;
@@ -66,20 +68,19 @@ TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title) : QDia
     QObject::connect(browser_.get(), &TikTokAuthBrowser::loadFinished, this,
                      &TikTokAuthDialog::pageLoadFinished);
     QObject::connect(browser_.get(), &TikTokAuthBrowser::ready, this, [this]() {
-        notice_->setText(tr("Starting the embedded login browser..."));
         if (stack_->count() > 1)
             stack_->setCurrentIndex(1);
         emit browserReady();
     });
     QObject::connect(browser_.get(), &TikTokAuthBrowser::failed, this, [this](const QString &message) {
         notice_->setText(message.isEmpty()
-                             ? tr("The embedded TikTok login browser could not be started.")
+                             ? QString::fromUtf8(obs_module_text("TikTok.BrowserInitFailed"))
                              : message);
         stack_->setCurrentIndex(0);
         emit browserFailed(message);
     });
 
-    notice_->setText(tr("Starting the embedded login browser..."));
+    notice_->setText(QString::fromUtf8(obs_module_text("TikTok.BrowserStarting")));
     stack_->addWidget(browser_->widget());
     setLayout(layout);
 

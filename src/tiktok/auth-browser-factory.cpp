@@ -95,22 +95,14 @@ std::unique_ptr<TikTokAuthBrowser> create(QWidget *parent, QString *error)
     const TikTokAuthBackend backend = availableBackend();
     std::unique_ptr<TikTokAuthBrowser> browser;
 
-    switch (backend) {
-    case TikTokAuthBackend::WebEngine:
+    if (backend == TikTokAuthBackend::WebEngine) {
 #if defined(WITH_TIKTOK_WEBENGINE)
         browser = std::make_unique<TikTokWebEngineBrowser>(parent);
-#else
-        break;
 #endif
-    case TikTokAuthBackend::WebView2:
+    } else if (backend == TikTokAuthBackend::WebView2) {
 #if defined(WITH_TIKTOK_WEBVIEW2)
         browser = std::make_unique<TikTokWebView2Browser>(parent);
-#else
-        break;
 #endif
-    case TikTokAuthBackend::None:
-    default:
-        break;
     }
 
     if (!browser) {

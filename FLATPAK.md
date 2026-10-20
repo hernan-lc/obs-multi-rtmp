@@ -158,6 +158,10 @@ TikTok 登录使用内嵌的 Qt WebEngine 浏览器完成 TikTok/Streamlabs 交�
   `Qt6::WebEngineWidgets`（"有 Qt Widgets" 不等于 "有 Qt WebEngine"）。
   缺失时构建仍能成功，但登录对话框会提示当前包不支持内嵌登录，
   不会回退到手动 token。
+- 后端选择：Linux 固定使用 Qt WebEngine 后端，可用
+  `-DTIKTOK_BROWSER_BACKEND=qtwebengine` 显式指定（默认 `auto` 在
+  Linux/macOS 上同样选择 Qt WebEngine；`webview2` 仅限 Windows）。
+  开关 `ENABLE_TIKTOK_LOGIN=ON` 时若无法配置任何后端，配置阶段直接失败。
 - 运行期：除编译通过外，还必须在最终 OBS Flatpak 沙箱内确认
   `QtWebEngineProcess` 及 resources/locales 存在且可启动，并验证登录窗口
   能打开 TikTok 与 Streamlabs 页面、Cookie 与 JavaScript 正常工作。
