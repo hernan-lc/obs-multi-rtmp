@@ -3,6 +3,17 @@
 
 #include "tiktok/auth-browser-factory.h"
 
+#if defined(WITH_TIKTOK_WEBVIEW2)
+#include <obs-module.h>
+
+// The backend uses module-local translations, normally supplied by the
+// plugin entry point. Selection tests do not load an OBS plugin or locale.
+const char *obs_module_text(const char *key)
+{
+    return key;
+}
+#endif
+
 static int g_checks = 0;
 #define CHECK(cond)                                                  \
     do {                                                             \
