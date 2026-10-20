@@ -50,9 +50,10 @@ credentialed token exchange, committed-document retry, and `/info` validation
 match the reference behavior. Existing C++ authentication was retained.
 
 The reference's current Rust/Wry browser uses its platform-default UA, while its
-API uses the same frozen Streamlabs UA constant as this project. Per the requested
-Qt policy, WebEngine explicitly uses that constant too. This needs real login
-verification on each packaged WebEngine version.
+API uses the same frozen Streamlabs UA constant as this project. Both browser
+backends (Qt WebEngine and Edge WebView2) use that constant too, so the
+provider sees an identical client on every platform. This needs real login
+verification on each packaged backend version.
 
 The browser has one persistent profile for the entire attempt, with cookies and
 local storage enabled. Existing URL/load signals remain. A 1500 ms fallback polls
@@ -60,6 +61,33 @@ both the Qt URL and `window.location.href`, with attempt/lifetime guards. Timers
 stop on success, failure, cancellation, dialog destruction and shutdown. The
 in-page exchange guards in-flight fetches without disabling the committed-document
 retry. Dialog pointers and the notification parent use QPointer.
+
+## Browser backends
+
+The authentication state machine talks to one interface (`TikTokAuthBrowser`)
+and never to a concrete browser. Backends implement asynchronous
+initialization (`ready`/`failed`), navigation, URL observation, load events,
+JavaScript execution and session cleanup; a backend that cannot provide these
+capabilities is never selected.
+
+| Platform | Backend | Notes |
+| --- | --- | --- |
+| Windows | Microsoft Edge WebView2 | Native control in a child window; Evergreen runtime required |
+| Linux | Qt 6 WebEngine | Profile in the user config directory |
+| macOS | Qt 6 WebEngine | Profile in the user config directory |
+
+The first navigation is queued until the backend reports readiness, so a slow
+WebView2 start can never lose the login URL. A backend failure (missing
+runtime, initialization error, crashed browser process) aborts the attempt with
+an actionable message, and a backend that does not become ready within 30 s
+times out.
+
+The WebView2 backend blocks local files, script URLs, downloads, popups outside
+the login window, all permission requests, host objects and web messaging. The
+privileged token exchange script only runs on the expected HTTPS Streamlabs
+success document (checked in C++ and again inside the page). JavaScript results
+are converted from the WebView2 JSON serialization into the same QVariant shapes
+the WebEngine backend returns.
 
 ## Automated validation
 
@@ -109,13 +137,30 @@ an account and verifies:
   (not just creation) remains untested.
 
 The optional Node test executes the generated exchange script, checking the
-expected-document fence, in-flight fetch guard, retained settled result and fresh
-document retry. Existing response, auth-flow, PKCE, credential-store, auth-URL,
-exchange and cleanup tests remain enabled.
+expected-document fence, the HTTPS-only fence, in-flight fetch guard, retained
+settled result and fresh document retry. Existing response, auth-flow, PKCE,
+credential-store, auth-URL, exchange and cleanup tests remain enabled.
+
+New suites for the browser refactor:
+
+- `test-tiktok-auth-browser-factory`: platform selection (WebView2 first on
+  Windows, Qt WebEngine elsewhere), no silent downgrade to an unusable
+  backend, capability contract.
+- `test-tiktok-auth-browser`: mock backend lifecycle - queued navigation until
+  readiness, initialization failure, ready/failed exclusivity, cleanup.
+- `test-tiktok-auth-jsvalue`: WebView2 JSON result conversion (primitives,
+  objects, arrays, null, malformed input).
+
+The Windows backend cannot be compiled outside a Windows toolchain. It was
+syntax checked against a transcription of the pinned SDK header (two real API
+mistakes were found that way: `Cancel` is a property and navigation is driven
+by the web view, not by the controller). A real MSVC build, an installed OBS
+and an authorized TikTok account are still required before any claim about
+the Windows login working.
 
 ## Results split: automated / manual / not run
 
-Automated (run in this branch; see commands above): all 9 ctest suites pass,
+Automated (run in this branch; see commands above): all 14 ctest suites pass,
 including the extended `test-tiktok-lifecycle` checks listed above, on Linux
 with system libobs 30 / Qt 6.12 (repo targets OBS 32.2.1; API used here is
 stable across both).
@@ -127,12 +172,34 @@ custom-scene and YouTube/Twitch/Kick/custom-RTMP checks on a real install.
 Not run: TikTok-authenticated LIVE (no account in this environment), real
 RTMP handshake bytes (no RTMP peer here; covered via refused-connection
 mapping), VAAPI/NVENC streaming runs (creation proven for VAAPI, streaming
-not attempted), Windows/macOS builds and packaged-WebEngine login (need
-their CI/platform environments). Note: repo CI previously triggered only
-on tags/`workflow_dispatch`; `push.yaml` now also triggers on pull
-requests to master/main, so this PR should gain build checks once
-reviewed on GitHub. Until those are green, results above are from local
-runs quoted verbatim.
+not attempted), the Windows/macOS builds and any packaged login (they need
+their CI/platform environments and, for the login, a real account). Note:
+repo CI previously triggered only on tags/`workflow_dispatch`; `push.yaml`
+now also triggers on pull requests to master/main, so this PR should gain
+build checks once reviewed on GitHub. Until those are green, results above
+are from local runs quoted verbatim.
+
+## Windows / WebView2 manual checklist
+
+Requires a Windows machine with OBS, the Evergreen WebView2 runtime and an
+authorized TikTok account.
+
+| Scenario | Expected behavior |
+| --- | --- |
+| 1. Fresh login | Login window opens with the native browser; login succeeds |
+| 2. Existing TikTok session | The saved session is reused, no re-authentication needed |
+| 3. QR / two factor | The factor step completes inside the login window |
+| 4. Cancel during startup | The window closes, no credential is stored |
+| 5. Cancel during the exchange | No token is stored, the previous session survives |
+| 6. Login timeout | An actionable timeout message, no stuck window |
+| 7. Missing WebView2 runtime | The login reports the missing runtime with install guidance |
+| 8. Browser process killed | The attempt fails with a clear message, OBS stays responsive |
+| 9. Resize / move / DPI change | The browser follows the window, input keeps working |
+| 10. LIVE-access application page | The page opens in the same native browser |
+| 11. Logout | The profile directory is removed, the credential is deleted |
+| 12. 20x login/logout | No growing handle or memory usage in the task manager |
+| 13. OBS closed during login | No crash, no leftover browser process |
+| 14. Installed release build | Works without any Qt WebEngine runtime present |
 
 ## Live manual validation still required
 

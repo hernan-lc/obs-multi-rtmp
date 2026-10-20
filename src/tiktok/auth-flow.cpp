@@ -10,7 +10,10 @@ TikTokAuthFlow::TikTokAuthFlow(uint64_t attemptId)
 
 TikTokAuthFlow::NavAction TikTokAuthFlow::onNavigate(const QUrl &url, QString *outCode)
 {
-    lastUrl_ = url.toString();
+    // Only the scheme, host and path are remembered: the query string of
+    // the authorization URL carries the single-use code and must never be
+    // kept (or logged).
+    lastUrl_ = url.adjusted(QUrl::RemoveQuery).toString();
     // Success wins over everything and fires exactly once.
     if (!exchangeStarted_) {
         if (auto code = TikTokAuthUrl::ExtractAuthorizationCode(url)) {

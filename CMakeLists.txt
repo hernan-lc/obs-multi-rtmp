@@ -49,6 +49,10 @@ if(ENABLE_FRONTEND_API)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
 endif()
 
+if(NOT TIKTOK_BROWSER_BACKEND MATCHES "^(auto|webview2|qtwebengine|none)$")
+  message(FATAL_ERROR "obs-multi-rtmp: invalid TIKTOK_BROWSER_BACKEND='${TIKTOK_BROWSER_BACKEND}' (expected auto, webview2, qtwebengine or none)")
+endif()
+
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
@@ -61,10 +65,6 @@ if(ENABLE_QT)
   # macOS use Qt WebEngine. ENABLE_TIKTOK_LOGIN decides whether a missing
   # backend is a configuration error (ON) or only a warning (AUTO).
   # ---------------------------------------------------------------------------
-  if(NOT TIKTOK_BROWSER_BACKEND MATCHES "^(auto|webview2|qtwebengine|none)$")
-    message(FATAL_ERROR "obs-multi-rtmp: invalid TIKTOK_BROWSER_BACKEND='${TIKTOK_BROWSER_BACKEND}' (expected auto, webview2, qtwebengine or none)")
-  endif()
-
   set(TIKTOK_BROWSER_BACKEND_SELECTED "none")
   set(TIKTOK_HAVE_WEBENGINE OFF)
   set(TIKTOK_HAVE_WEBVIEW2 OFF)
@@ -130,7 +130,9 @@ if(ENABLE_QT)
     )
   endif()
 
-  if(TIKTOK_BROWSER_BACKEND_SELECTED STREQUAL "none")
+  if(ENABLE_TIKTOK_LOGIN STREQUAL "OFF")
+    message(STATUS "obs-multi-rtmp: embedded TikTok login disabled by configuration")
+  elseif(TIKTOK_BROWSER_BACKEND_SELECTED STREQUAL "none")
     if(ENABLE_TIKTOK_LOGIN STREQUAL "ON")
       message(FATAL_ERROR "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN=ON requires a TikTok login browser backend, but none could be configured (TIKTOK_BROWSER_BACKEND=${TIKTOK_BROWSER_BACKEND})")
     else()
@@ -155,7 +157,11 @@ if(ENABLE_QT)
 endif()
 
 if(NOT ENABLE_QT AND NOT ENABLE_TIKTOK_LOGIN STREQUAL "OFF")
-  message(WARNING "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN requires ENABLE_QT; embedded login will be unavailable")
+  if(ENABLE_TIKTOK_LOGIN STREQUAL "ON")
+    message(FATAL_ERROR "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN=ON requires ENABLE_QT")
+  else()
+    message(WARNING "obs-multi-rtmp: ENABLE_TIKTOK_LOGIN requires ENABLE_QT; embedded login will be unavailable")
+  endif()
 endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE

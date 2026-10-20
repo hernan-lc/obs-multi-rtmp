@@ -120,10 +120,43 @@ fuzzy-matches an unrelated game. Category suggestions appear as you type.
   access is inherited from OBS). See [FLATPAK.md](./FLATPAK.md).
 
 CI presets and Flatpak use `ENABLE_TIKTOK_LOGIN=AUTO`: embedded login is
-enabled only when the supplied Qt bundle includes WebEngine. Packages built
+enabled only when a browser backend could be configured. Packages built
 without it show the browser-unavailable message. Use `ENABLE_TIKTOK_LOGIN=ON`
-to require login support (configuration fails if WebEngine is missing), or
+to require login support (configuration fails if no backend is available), or
 `OFF` to disable it. Ubuntu CI installs `qt6-webengine-dev` and `libsecret-1-dev`.
+
+### Embedded login browser
+
+The interactive TikTok login needs an embedded browser. The plugin ships
+one backend per platform and picks it automatically:
+
+| Platform | Backend | Runtime requirement |
+| --- | --- | --- |
+| Windows | Microsoft Edge WebView2 (native) | Evergreen WebView2 runtime |
+| Linux | Qt 6 WebEngine | Qt WebEngine |
+| macOS | Qt 6 WebEngine | Qt WebEngine |
+
+Windows uses the native WebView2 control, so a stock OBS installation
+without the Qt WebEngine runtime can still log in. The Evergreen WebView2
+runtime is installed together with Microsoft Edge; when it is missing, the
+login window explains how to install it
+(https://developer.microsoft.com/microsoft-edge/webview2/).
+
+Build configuration:
+
+- `ENABLE_TIKTOK_LOGIN=ON|OFF|AUTO` decides whether a missing browser
+  backend is a configuration error (`ON`), a warning (`AUTO`) or disables
+  the login (`OFF`).
+- `TIKTOK_BROWSER_BACKEND=auto|webview2|qtwebengine|none` selects the
+  backend explicitly. `auto` prefers WebView2 on Windows and Qt WebEngine
+  everywhere else. `webview2` is only valid on Windows, `none` disables
+  the embedded login.
+
+Official Windows builds use `ENABLE_TIKTOK_LOGIN=ON` and
+`TIKTOK_BROWSER_BACKEND=webview2`: the release pipeline fails when the
+WebView2 backend cannot be built, and the packaged plugin is verified to
+contain the WebView2 loader. The SDK is downloaded from a pinned NuGet
+package with a verified SHA-256 checksum; no browser is bundled.
 
 ### Security notes
 
@@ -135,10 +168,18 @@ to require login support (configuration fails if WebEngine is missing), or
 - The credential is only ever sent to `https://streamlabs.com` over TLS
   with certificate verification enabled. It is never logged and never
   placed in RTMP URLs.
-- The login WebView handles TikTok/Streamlabs cookies in a dedicated
-  profile; generated RTMP server/key pairs remain in memory only.
+- The login browser runs in a dedicated profile under the user
+  configuration directory
+  (`<config>/obs-multi-rtmp/tiktok-auth-webview`), never in the OBS
+  installation folder and never in the user's regular browser profile.
+  The browser has no host objects, no web messaging, no downloads, no
+  permissions and no local file access; the privileged token exchange only
+  runs on the expected HTTPS Streamlabs success document.
 - Logging deliberately redacts authentication credentials and stream keys:
-  auth URLs are logged as host + path only, without query strings.
+  auth URLs are logged as host + path only, without query strings. The
+  observed navigation URL is stored without its query string, so the
+  single-use authorization code is never kept in memory or logs.
+- Generated RTMP server/key pairs remain in memory only.
 
 ### Troubleshooting
 
@@ -158,9 +199,17 @@ to require login support (configuration fails if WebEngine is missing), or
   unknown": check network access and proxy settings. Requests time out
   after 5 s (connect) / 15 s (total); saved credentials are kept and
   revalidated later.
-- "The embedded TikTok login browser (Qt WebEngine) is not available in
-  this build.": the package lacks the Qt WebEngine runtime; use a build
-  with WebEngine support.
+- "The embedded TikTok login browser is not available in this build.": the
+  package was built without a login backend. On Windows use a package
+  built with the WebView2 backend, on Linux/macOS one built with the Qt
+  WebEngine backend.
+- "The Microsoft Edge WebView2 runtime is not installed. ...": install the
+  Evergreen WebView2 runtime
+  (https://developer.microsoft.com/microsoft-edge/webview2/) and retry. It
+  normally comes with Microsoft Edge.
+- "The embedded login browser could not be started.": the browser backend
+  could not initialize. Restart OBS and retry; if it persists, check the
+  OBS log for the reported error code.
 - "The shared OBS encoder is unavailable. ...": the target shares OBS's
   streaming (or recording) encoder but that OBS output is not running.
   Either start the corresponding OBS output first, or open Modify and pick

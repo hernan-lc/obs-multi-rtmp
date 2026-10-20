@@ -31,6 +31,9 @@ namespace {
 constexpr int kPollIntervalMs = 250;
 constexpr int kExchangeTimeoutMs = 30000;
 constexpr int kOverallTimeoutMs = 10 * 60 * 1000;
+// A browser backend that does not become ready in time (missing runtime,
+// blocked download, crashed browser process) must not block the attempt.
+constexpr int kBrowserInitTimeoutMs = 30000;
 constexpr int kTikTokRecheckDelayMs = 1500;
 constexpr int kAccessRefreshMs = 15 * 60 * 1000;
 constexpr int kMinRefreshGapSec = 60;
@@ -479,6 +482,22 @@ void TikTokAuthManager::login(QWidget *parent)
     lastPolledUrl_ = QUrl();
     authUrlPollInProgress_ = false;
 
+    browserInitTimer_ = new QTimer(this);
+    browserInitTimer_->setSingleShot(true);
+    QObject::connect(browserInitTimer_, &QTimer::timeout, this, [this, attempt]() {
+        bool pending = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending = loginActive_ && attempt == loginAttempt_ && dialog_ &&
+                      !dialog_->isBrowserReady();
+        }
+        if (!pending)
+            return;
+        blog(LOG_WARNING, TAG "[TikTokAuth] Browser initialization timed out");
+        finishLoginAttempt(attempt, QString::fromUtf8(obs_module_text("TikTok.LoginTimeout")));
+    });
+    browserInitTimer_->start(kBrowserInitTimeoutMs);
+
     // The backend initializes asynchronously. Some backends are ready
     // before the caller can connect (the signal is emitted inside the
     // dialog constructor), so the ready state is checked explicitly.
@@ -495,6 +514,11 @@ void TikTokAuthManager::onBrowserReady(uint64_t attempt)
         if (!loginActive_ || attempt != loginAttempt_ || !dialog_)
             return;
     }
+    if (browserInitTimer_) {
+        browserInitTimer_->stop();
+        browserInitTimer_->deleteLater();
+        browserInitTimer_ = nullptr;
+    }
     if (authUrlPollTimer_)
         return; // already running for this attempt
     blog(LOG_INFO, TAG "[TikTokAuth] Browser ready (%s)",
@@ -509,6 +533,11 @@ void TikTokAuthManager::onBrowserFailed(uint64_t attempt, const QString &error)
         std::lock_guard<std::mutex> lock(mutex_);
         if (!loginActive_ || attempt != loginAttempt_)
             return;
+    }
+    if (browserInitTimer_) {
+        browserInitTimer_->stop();
+        browserInitTimer_->deleteLater();
+        browserInitTimer_ = nullptr;
     }
     blog(LOG_WARNING, TAG "[TikTokAuth] Browser backend failed");
     const QString message = error.isEmpty()
@@ -1257,6 +1286,11 @@ void TikTokAuthManager::stopLoginTimers()
         overallTimeout_->deleteLater();
         overallTimeout_ = nullptr;
     }
+    if (browserInitTimer_) {
+        browserInitTimer_->stop();
+        browserInitTimer_->deleteLater();
+        browserInitTimer_ = nullptr;
+    }
 }
 
 void TikTokAuthManager::teardownDialog()
@@ -1277,7 +1311,7 @@ void TikTokAuthManager::scrubDialogSession()
 
 void TikTokAuthManager::shutdown()
 {
-    const std::vector<QTimer *> timers = {authUrlPollTimer_, pollTimer_, exchangeTimeout_, overallTimeout_, refreshTimer_};
+    const std::vector<QTimer *> timers = {authUrlPollTimer_, pollTimer_, exchangeTimeout_, overallTimeout_, browserInitTimer_, refreshTimer_};
     auto *loginDialog = dialog_.data();
     auto *applyDialog = applyDialog_.data();
     stopLoginTimers();

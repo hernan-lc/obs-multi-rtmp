@@ -23,6 +23,7 @@
 
 #include "tiktok/auth-jsvalue.h"
 #include "tiktok/auth-profile.h"
+#include "tiktok/constants.h"
 
 #include <QDir>
 #include <QEvent>
@@ -313,6 +314,15 @@ void TikTokWebView2Browser::applySettings()
     settings->put_AreDefaultContextMenusEnabled(FALSE);
     settings->put_IsZoomControlEnabled(FALSE);
     settings->put_IsBuiltInErrorPageEnabled(TRUE);
+
+    // The same frozen Streamlabs user agent the WebEngine backend uses, so
+    // the provider sees an identical client on every platform.
+    ComPtr<ICoreWebView2Settings2> settings2;
+    if (SUCCEEDED(settings.As(&settings2)) && settings2) {
+        const std::wstring agent =
+            WideString(QString::fromLatin1(TikTokConstants::kStreamlabsUserAgent));
+        settings2->put_UserAgent(agent.c_str());
+    }
 }
 
 void TikTokWebView2Browser::registerEventHandlers()

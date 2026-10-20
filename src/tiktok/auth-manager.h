@@ -216,6 +216,7 @@ private:
     QTimer *pollTimer_ = nullptr;
     QTimer *exchangeTimeout_ = nullptr;
     QTimer *overallTimeout_ = nullptr;
+    QTimer *browserInitTimer_ = nullptr;
     QTimer *refreshTimer_ = nullptr;
     QObject *deferredContext_ = nullptr; // cancels one-shot continuations on unload
 };

@@ -4,6 +4,7 @@
 #include <QUrl>
 
 #include "tiktok/auth-flow.h"
+#include "tiktok/auth-url.h"
 
 static int g_checks = 0;
 #define CHECK(cond)                                                  \
@@ -129,6 +130,20 @@ static int TestForeignCodesIgnored()
     return 0;
 }
 
+static int TestLastUrlNeverKeepsTheCode()
+{
+    // The observed URL may carry the single-use authorization code: it must
+    // never be kept (and therefore never be logged).
+    TikTokAuthFlow flow(1);
+    flow.onNavigate(QUrl("https://streamlabs.com/other?code=SECRET"), nullptr);
+    CHECK(!flow.lastUrl().contains("SECRET"));
+    CHECK(!flow.lastUrl().contains("code="));
+    CHECK(!flow.lastUrl().contains("?"));
+    // The recheck still recognizes a Streamlabs page without the query.
+    CHECK(TikTokAuthUrl::IsStreamlabsUrl(QUrl(flow.lastUrl())));
+    return 0;
+}
+
 int main()
 {
     if (TestFreshAttempt())
@@ -146,6 +161,8 @@ int main()
     if (TestReevalBlockedAfterSettle())
         return 1;
     if (TestForeignCodesIgnored())
+        return 1;
+    if (TestLastUrlNeverKeepsTheCode())
         return 1;
     std::cout << "all " << g_checks << " checks passed\n";
     return 0;
