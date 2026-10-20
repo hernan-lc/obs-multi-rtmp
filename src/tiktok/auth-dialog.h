@@ -38,6 +38,8 @@ public:
     bool isBrowserReady() const;
     // Name of the active browser backend, for logs and error messages.
     QString browserBackendName() const;
+    // The backend failure message, empty while the backend is healthy.
+    QString browserError() const { return browserError_; }
 
     QUrl currentUrl() const;
     void navigate(const QUrl &url);
@@ -62,4 +64,5 @@ private:
     std::unique_ptr<TikTokAuthBrowser> browser_;
     QStackedWidget *stack_ = nullptr;
     QLabel *notice_ = nullptr;
+    QString browserError_;
 };

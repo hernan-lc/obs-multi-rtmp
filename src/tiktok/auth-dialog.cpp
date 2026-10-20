@@ -73,11 +73,12 @@ TikTokAuthDialog::TikTokAuthDialog(QWidget *parent, const QString &title) : QDia
         emit browserReady();
     });
     QObject::connect(browser_.get(), &TikTokAuthBrowser::failed, this, [this](const QString &message) {
-        notice_->setText(message.isEmpty()
-                             ? QString::fromUtf8(obs_module_text("TikTok.BrowserInitFailed"))
-                             : message);
+        browserError_ = message.isEmpty()
+                            ? QString::fromUtf8(obs_module_text("TikTok.BrowserInitFailed"))
+                            : message;
+        notice_->setText(browserError_);
         stack_->setCurrentIndex(0);
-        emit browserFailed(message);
+        emit browserFailed(browserError_);
     });
 
     notice_->setText(QString::fromUtf8(obs_module_text("TikTok.BrowserStarting")));

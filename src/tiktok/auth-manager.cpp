@@ -451,6 +451,13 @@ void TikTokAuthManager::login(QWidget *parent)
                            QString::fromUtf8(obs_module_text("TikTok.BrowserUnavailable")));
         return;
     }
+    if (!dialog_->browserError().isEmpty()) {
+        // The backend failed while the dialog was created (for example a
+        // missing runtime): report it right away instead of waiting for the
+        // initialization timeout.
+        finishLoginAttempt(attempt, dialog_->browserError());
+        return;
+    }
     QObject::connect(dialog_, &TikTokAuthDialog::urlObserved, this,
                      [this, attempt](const QUrl &url) { onDialogUrl(attempt, url); });
     QObject::connect(dialog_, &TikTokAuthDialog::pageLoadFinished, this,
